@@ -1,0 +1,11 @@
+[package]
+name = "oak-protocol"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+stylus-sdk = "0.6"
+alloy-primitives = "0.5"
