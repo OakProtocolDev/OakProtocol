@@ -14,8 +14,8 @@ use stylus_sdk::{
 
 use crate::{
     constants::{
-        as_u256, COMMIT_REVEAL_DELAY, DEFAULT_FEE_BPS, FEE_DENOMINATOR,
-        MAX_COMMITMENT_AGE, MAX_FEE_BPS, MINIMUM_LIQUIDITY, TREASURY_FEE_BPS,
+        as_u256, q112_u256, COMMIT_REVEAL_DELAY, DEFAULT_FEE_BPS, FEE_DENOMINATOR,
+        GAS_REBATE_BPS, MAX_COMMITMENT_AGE, MAX_FEE_BPS, MINIMUM_LIQUIDITY, TREASURY_FEE_BPS,
     },
     errors::*,
     events::{
@@ -78,6 +78,71 @@ fn lock_reentrancy_guard(dex: &mut OakDEX) -> OakResult<()> {
 /// @dev Must be called after `lock_reentrancy_guard` to prevent deadlock.
 fn unlock_reentrancy_guard(dex: &mut OakDEX) {
     dex.locked.set(false);
+}
+
+/// Emergency circuit breaker: revert if protocol is paused.
+///
+/// @notice Applied to commit_swap, reveal_swap, and flash_swap.
+/// @dev Only owner can pause/unpause via pause() and unpause().
+fn require_not_paused(dex: &OakDEX) -> OakResult<()> {
+    if dex.paused.get() {
+        return Err(err(ERR_PAUSED));
+    }
+    Ok(())
+}
+
+/// Update TWAP oracle cumulative prices and last block.
+///
+/// @notice Must be called at the beginning of every swap (reveal_swap) and add_liquidity.
+/// @dev Uses Q112.64 fixed-point: price0 = reserve1/reserve0, price1 = reserve0/reserve1.
+///      On L2 we use block number as time index for gas efficiency.
+///      cumulative += price * (current_block - block_last); all math checked.
+fn update_oracle(dex: &mut OakDEX, reserve0: U256, reserve1: U256) -> OakResult<()> {
+    let block_last = dex.block_timestamp_last.get();
+    let current_block = U256::from(block::number());
+
+    if reserve0.is_zero() || reserve1.is_zero() {
+        dex.block_timestamp_last.set(current_block);
+        return Ok(());
+    }
+
+    let time_elapsed = current_block.checked_sub(block_last).unwrap_or(U256::ZERO);
+    if time_elapsed.is_zero() {
+        return Ok(());
+    }
+
+    let q112 = q112_u256();
+    // price0 = reserve1 / reserve0 in Q112.64
+    let price0 = reserve1
+        .checked_mul(q112)
+        .ok_or_else(|| err(ERR_OVERFLOW))?
+        .checked_div(reserve0)
+        .ok_or_else(|| err(ERR_DIVISION_BY_ZERO))?;
+    // price1 = reserve0 / reserve1 in Q112.64
+    let price1 = reserve0
+        .checked_mul(q112)
+        .ok_or_else(|| err(ERR_OVERFLOW))?
+        .checked_div(reserve1)
+        .ok_or_else(|| err(ERR_DIVISION_BY_ZERO))?;
+
+    let cum0_delta = price0
+        .checked_mul(time_elapsed)
+        .ok_or_else(|| err(ERR_OVERFLOW))?;
+    let cum1_delta = price1
+        .checked_mul(time_elapsed)
+        .ok_or_else(|| err(ERR_OVERFLOW))?;
+
+    let cum0 = dex.price0_cumulative_last.get();
+    let cum1 = dex.price1_cumulative_last.get();
+
+    let new_cum0 = cum0.checked_add(cum0_delta).ok_or_else(|| err(ERR_OVERFLOW))?;
+    let new_cum1 = cum1.checked_add(cum1_delta).ok_or_else(|| err(ERR_OVERFLOW))?;
+
+    dex.price0_cumulative_last.set(new_cum0);
+    dex.price1_cumulative_last.set(new_cum1);
+    dex.block_timestamp_last.set(current_block);
+
+    Ok(())
 }
 
 /// Pure CPMM math with a configurable total fee.
@@ -208,6 +273,12 @@ impl OakDEX {
         self.accrued_treasury_fees_token0.set(U256::ZERO);
         self.accrued_lp_fees_token0.set(U256::ZERO);
 
+        // TWAP oracle and gas-rebate placeholder.
+        self.price0_cumulative_last.set(U256::ZERO);
+        self.price1_cumulative_last.set(U256::ZERO);
+        self.block_timestamp_last.set(U256::ZERO);
+        self.accrued_gas_rebate_token0.set(U256::ZERO);
+
         // Contract starts active and unlocked.
         self.paused.set(false);
         self.locked.set(false);
@@ -266,9 +337,7 @@ impl OakDEX {
     /// @notice Stores a commitment hash and the current block number.
     /// @dev Part 1 of the commit‑reveal flow used for MEV resistance.
     pub fn commit_swap(&mut self, hash: FixedBytes<32>) -> OakResult<()> {
-        if self.paused.get() {
-            return Err(err(ERR_PAUSED));
-        }
+        require_not_paused(self)?;
 
         let sender = msg::sender();
 
@@ -291,9 +360,9 @@ impl OakDEX {
     /// Reveal a previously committed swap and execute it.
     ///
     /// @notice Performs hash verification, time‑lock enforcement, fee
-    ///         accounting, CPMM pricing, slippage checks, and token transfers.
+    ///         accounting, CPMM pricing, strict slippage and deadline checks, and token transfers.
     /// @dev Part 2 of commit‑reveal flow, providing strong MEV protection.
-    ///      Requires token0 and token1 addresses to perform transfers.
+    ///      Reverts with DeadlineExpired if block number > deadline, SlippageExceeded if output < min_amount_out.
     ///      Strict CEI: Lock acquired at start, released at end.
     ///
     /// # Arguments
@@ -301,7 +370,8 @@ impl OakDEX {
     /// * `token1` - Address of token1 (output token)
     /// * `amount_in` - Input token amount
     /// * `salt` - Random salt used in commitment
-    /// * `min_amount_out` - Minimum output tokens (slippage protection)
+    /// * `min_amount_out` - Minimum output tokens (strict slippage protection)
+    /// * `deadline` - Block number after which the transaction must revert (deadline protection)
     pub fn reveal_swap(
         &mut self,
         token0: Address,
@@ -309,9 +379,9 @@ impl OakDEX {
         amount_in: U256,
         salt: U256,
         min_amount_out: U256,
+        deadline: U256,
     ) -> OakResult<()> {
         // CRITICAL: Re-entrancy guard acquired at the VERY BEGINNING
-        // This must be the first state-modifying operation
         lock_reentrancy_guard(self)?;
 
         // Input sanitization: validate addresses
@@ -328,10 +398,14 @@ impl OakDEX {
             return Err(err(ERR_INSUFFICIENT_OUTPUT_AMOUNT));
         }
 
-        // Pause guard
-        if self.paused.get() {
+        // Emergency circuit breaker
+        require_not_paused(self)?;
+
+        // Deadline protection: revert if transaction is included after deadline (block number).
+        let current_block = U256::from(block::number());
+        if current_block > deadline {
             unlock_reentrancy_guard(self);
-            return Err(err(ERR_PAUSED));
+            return Err(err(ERR_DEADLINE_EXPIRED));
         }
 
         let sender = msg::sender();
@@ -359,7 +433,7 @@ impl OakDEX {
         }
 
         let commit_block = self.commitment_timestamps.setter(sender).get();
-        let current_block = U256::from(block::number());
+        // current_block already set above for deadline check
 
         // Check commitment expiration (prevent storage bloat)
         let max_block = commit_block
@@ -393,6 +467,12 @@ impl OakDEX {
         let reserve1 = self.reserves1.get();
         let fee_bps = self.protocol_fee_bps.get();
 
+        // TWAP oracle: update cumulative prices at the beginning of every swap.
+        if let Err(e) = update_oracle(self, reserve0, reserve1) {
+            unlock_reentrancy_guard(self);
+            return Err(e);
+        }
+
         // Compute amount_out using CPMM with total fee.
         let amount_out = match get_amount_out_with_fee(amount_in, reserve0, reserve1, fee_bps) {
             Ok(out) => out,
@@ -402,10 +482,10 @@ impl OakDEX {
             }
         };
 
-        // Explicit slippage protection via user‑provided minimum.
+        // Strict slippage protection: revert with SlippageExceeded if actual output below minimum.
         if amount_out < min_amount_out {
             unlock_reentrancy_guard(self);
-            return Err(err(ERR_INSUFFICIENT_OUTPUT_AMOUNT));
+            return Err(err(ERR_SLIPPAGE_EXCEEDED));
         }
 
         // Compute fee split for analytics and treasury accounting.
@@ -481,6 +561,33 @@ impl OakDEX {
         self.accrued_treasury_fees_token0.set(new_treasury_fees);
         self.accrued_lp_fees_token0.set(new_lp_fees);
 
+        // Gas-rebate placeholder: track a small portion of protocol fee for future gas rebates.
+        let total_fee = treasury_fee
+            .checked_add(lp_fee)
+            .ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_OVERFLOW)
+            })?;
+        let gas_rebate = total_fee
+            .checked_mul(as_u256(GAS_REBATE_BPS))
+            .ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_OVERFLOW)
+            })?
+            .checked_div(as_u256(FEE_DENOMINATOR))
+            .ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_DIVISION_BY_ZERO)
+            })?;
+        if !gas_rebate.is_zero() {
+            let acc = self.accrued_gas_rebate_token0.get();
+            let new_acc = acc.checked_add(gas_rebate).ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_OVERFLOW)
+            })?;
+            self.accrued_gas_rebate_token0.set(new_acc);
+        }
+
         // Transfer tokens: user -> contract (token0)
         let contract_addr = contract::address();
         if let Err(e) = safe_transfer_from(token0, sender, contract_addr, amount_in) {
@@ -540,15 +647,17 @@ impl OakDEX {
             return Err(err(ERR_AMOUNT1_ZERO));
         }
 
-        // Pause guard
-        if self.paused.get() {
-            unlock_reentrancy_guard(self);
-            return Err(err(ERR_PAUSED));
-        }
+        require_not_paused(self)?;
 
         let reserve0 = self.reserves0.get();
         let reserve1 = self.reserves1.get();
         let min_liquidity = self.min_liquidity.get();
+
+        // TWAP oracle: update cumulative prices at the beginning of every add_liquidity.
+        if let Err(e) = update_oracle(self, reserve0, reserve1) {
+            unlock_reentrancy_guard(self);
+            return Err(e);
+        }
 
         let new_reserve0 = reserve0
             .checked_add(amount0)
@@ -745,11 +854,7 @@ impl OakDEX {
             return Err(err(ERR_INSUFFICIENT_INPUT_AMOUNT));
         }
 
-        // Pause guard
-        if self.paused.get() {
-            unlock_reentrancy_guard(self);
-            return Err(err(ERR_PAUSED));
-        }
+        require_not_paused(self)?;
 
         // Snapshot reserves and fee configuration before the swap
         let reserve0_before = self.reserves0.get();
@@ -1044,6 +1149,33 @@ impl OakDEX {
 
             self.accrued_treasury_fees_token0.set(new_treasury_fees);
             self.accrued_lp_fees_token0.set(new_lp_fees);
+
+            // Gas-rebate placeholder: track a small portion of protocol fee (token0 side).
+            let total_fee0 = treasury_fee0
+                .checked_add(lp_fee0)
+                .ok_or_else(|| {
+                    unlock_reentrancy_guard(self);
+                    err(ERR_OVERFLOW)
+                })?;
+            let gas_rebate = total_fee0
+                .checked_mul(as_u256(GAS_REBATE_BPS))
+                .ok_or_else(|| {
+                    unlock_reentrancy_guard(self);
+                    err(ERR_OVERFLOW)
+                })?
+                .checked_div(as_u256(FEE_DENOMINATOR))
+                .ok_or_else(|| {
+                    unlock_reentrancy_guard(self);
+                    err(ERR_DIVISION_BY_ZERO)
+                })?;
+            if !gas_rebate.is_zero() {
+                let acc = self.accrued_gas_rebate_token0.get();
+                let new_acc = acc.checked_add(gas_rebate).ok_or_else(|| {
+                    unlock_reentrancy_guard(self);
+                    err(ERR_OVERFLOW)
+                })?;
+                self.accrued_gas_rebate_token0.set(new_acc);
+            }
         }
 
         // Emit FlashSwap event

@@ -27,6 +27,10 @@ pub const ERR_VOLUME_OVERFLOW: &[u8] = b"VOLUME_OVERFLOW";
 
 pub const ERR_INSUFFICIENT_INPUT_AMOUNT: &[u8] = b"INSUFFICIENT_INPUT_AMOUNT";
 pub const ERR_INSUFFICIENT_OUTPUT_AMOUNT: &[u8] = b"INSUFFICIENT_OUTPUT_AMOUNT";
+/// Strict slippage protection: actual output below user minimum.
+pub const ERR_SLIPPAGE_EXCEEDED: &[u8] = b"SLIPPAGE_EXCEEDED";
+/// Deadline protection: transaction included after user-specified deadline.
+pub const ERR_DEADLINE_EXPIRED: &[u8] = b"DEADLINE_EXPIRED";
 pub const ERR_OVERFLOW: &[u8] = b"OVERFLOW";
 pub const ERR_FEE_OVERFLOW: &[u8] = b"FEE_OVERFLOW";
 pub const ERR_DIVISION_BY_ZERO: &[u8] = b"DIVISION_BY_ZERO";

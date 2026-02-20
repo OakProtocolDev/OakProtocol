@@ -57,6 +57,17 @@ sol_storage! {
         /// Total trading volume for token1 (for analytics).
         StorageU256 total_volume_token1;
 
+        /// TWAP Oracle: cumulative price of token0 in Q112.64 format (price0 = reserve1/reserve0).
+        StorageU256 price0_cumulative_last;
+        /// TWAP Oracle: cumulative price of token1 in Q112.64 format (price1 = reserve0/reserve1).
+        StorageU256 price1_cumulative_last;
+        /// TWAP Oracle: block number (or timestamp) of last oracle update.
+        /// @dev On L2 we use block number as time index for gas efficiency.
+        StorageU256 block_timestamp_last;
+
+        /// Gas-rebate reserve: portion of protocol fee tracked for future gas rebates (placeholder).
+        StorageU256 accrued_gas_rebate_token0;
+
         /// Emergency pause switch (if true, swaps are frozen).
         StorageBool paused;
 

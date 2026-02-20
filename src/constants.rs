@@ -27,6 +27,19 @@ pub const TREASURY_FEE_BPS: u64 = 12;
 /// LP share of the total fee in basis points (0.18%).
 pub const LP_FEE_BPS: u64 = DEFAULT_FEE_BPS - TREASURY_FEE_BPS;
 
+/// Gas-rebate share of total fee in basis points (placeholder for future gas rebates).
+/// @dev A small portion of protocol fee is tracked in accrued_gas_rebate_token0.
+pub const GAS_REBATE_BPS: u64 = 5;
+
+/// Q112.64 fixed-point multiplier for TWAP cumulative prices (2^112).
+pub const Q112: u128 = 1u128 << 112;
+
+/// Returns 2^112 as U256 for TWAP cumulative price math.
+#[inline]
+pub fn q112_u256() -> U256 {
+    U256::from(1u64).wrapping_shl(112)
+}
+
 /// Convenience helpers for working with `U256`-based math.
 pub fn as_u256(value: u64) -> U256 {
     U256::from(value)
