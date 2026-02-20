@@ -1,0 +1,16 @@
+{
+  "name": "oak-protocol-scripts",
+  "version": "0.1.0",
+  "description": "Interaction scripts for Oak Protocol",
+  "scripts": {
+    "interact": "ts-node interaction.ts"
+  },
+  "dependencies": {
+    "ethers": "^5.7.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.1",
+    "typescript": "^5.0.0"
+  }
+}

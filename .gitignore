@@ -1,1 +1,30 @@
-target/
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Environment
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.wasm
+*.wasm.gz
+
+# Logs
+*.log
+
+# Node (for scripts)
+node_modules/
+scripts/node_modules/

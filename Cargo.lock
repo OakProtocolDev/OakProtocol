@@ -60,6 +60,24 @@ dependencies = [
 
 [[package]]
 name = "alloy-sol-macro"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "970e5cf1ca089e964d4f7f7afc7c9ad642bfb1bdc695a20b0cba3b3c28954774"
+dependencies = [
+ "const-hex",
+ "dunce",
+ "heck 0.4.1",
+ "indexmap",
+ "proc-macro-error",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.116",
+ "syn-solidity 0.5.4",
+ "tiny-keccak",
+]
+
+[[package]]
+name = "alloy-sol-macro"
 version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b40397ddcdcc266f59f959770f601ce1280e699a91fc1862f29cef91707cd09"
@@ -80,13 +98,13 @@ checksum = "867a5469d61480fea08c7333ffeca52d5b621f5ca2e44f271b117ec1fc9a0525"
 dependencies = [
  "alloy-sol-macro-input",
  "const-hex",
- "heck",
+ "heck 0.5.0",
  "indexmap",
  "proc-macro-error",
  "proc-macro2",
  "quote",
  "syn 2.0.116",
- "syn-solidity",
+ "syn-solidity 0.7.7",
  "tiny-keccak",
 ]
 
@@ -98,11 +116,23 @@ checksum = "2e482dc33a32b6fadbc0f599adea520bd3aaa585c141a80b404d0a3e3fa72528"
 dependencies = [
  "const-hex",
  "dunce",
- "heck",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.116",
- "syn-solidity",
+ "syn-solidity 0.7.7",
+]
+
+[[package]]
+name = "alloy-sol-types"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a059d4d2c78f8f21e470772c75f9abd9ac6d48c2aaf6b278d1ead06ed9ac664"
+dependencies = [
+ "alloy-primitives 0.5.4",
+ "alloy-sol-macro 0.5.4",
+ "const-hex",
+ "serde",
 ]
 
 [[package]]
@@ -112,7 +142,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a49042c6d3b66a9fe6b2b5a8bf0d39fc2ae1ee0310a2a26ffedd79fb097878dd"
 dependencies = [
  "alloy-primitives 0.7.6",
- "alloy-sol-macro",
+ "alloy-sol-macro 0.7.7",
  "const-hex",
 ]
 
@@ -712,6 +742,12 @@ checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 
 [[package]]
 name = "heck"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95505c38b4572b2d910cecb0281560f54b440a19336cbbcb27bf6ce6adc6f5a8"
+
+[[package]]
+name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
@@ -900,6 +936,7 @@ name = "oak-protocol"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives 0.5.4",
+ "alloy-sol-types 0.5.4",
  "stylus-sdk",
 ]
 
@@ -1373,7 +1410,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce199dd40c83734b835a6c952e29edd9a7e9370b438829c6b2cd908fd3acfb1e"
 dependencies = [
  "alloy-primitives 0.7.6",
- "alloy-sol-types",
+ "alloy-sol-types 0.7.6",
  "cfg-if",
  "convert_case 0.6.0",
  "lazy_static",
@@ -1382,7 +1419,7 @@ dependencies = [
  "regex",
  "sha3",
  "syn 1.0.109",
- "syn-solidity",
+ "syn-solidity 0.7.7",
 ]
 
 [[package]]
@@ -1392,7 +1429,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7121699320d19223b7b774c8f568febd0405338e8bf5ab8a3b212aa62687cf2a"
 dependencies = [
  "alloy-primitives 0.7.6",
- "alloy-sol-types",
+ "alloy-sol-types 0.7.6",
  "cfg-if",
  "derivative",
  "hex",
@@ -1422,6 +1459,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "syn-solidity"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91ede2e5b2c6bfac4bc0ff4499957a11725dc12a7ddb86270e827ef575892553"
+dependencies = [
+ "paste",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.116",
 ]
 
 [[package]]
@@ -1661,7 +1710,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea61de684c3ea68cb082b7a88508a8b27fcc8b797d738bfc99a82facf1d752dc"
 dependencies = [
  "anyhow",
- "heck",
+ "heck 0.5.0",
  "wit-parser",
 ]
 
@@ -1672,7 +1721,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7c566e0f4b284dd6561c786d9cb0142da491f46a9fbed79ea69cdad5db17f21"
 dependencies = [
  "anyhow",
- "heck",
+ "heck 0.5.0",
  "indexmap",
  "prettyplease",
  "syn 2.0.116",
