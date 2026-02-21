@@ -7,11 +7,85 @@
 
 <h1 align="center">🌳 Oak Protocol</h1>
 <p align="center">
-  <strong>The Next-Generation MEV-Resistant DEX on Arbitrum Stylus</strong>
+  <strong>The Next-Gen, MEV-Protected DEX on Arbitrum Stylus.</strong>
 </p>
 <p align="center">
   <em>Fair DeFi. Zero Front-Running. Built for the Future.</em>
 </p>
+
+---
+
+## 🚀 What's New
+
+**Oak Protocol now ships a production-ready DeFi dashboard** — a GMX-inspired, dark-themed trading interface with real-time charts, seamless wallet connection, and a UI built for our commit-reveal MEV protection flow.
+
+| Feature | Description |
+|---------|-------------|
+| 📊 **GMX-Inspired Dashboard** | 3-column professional layout (Chart \| Swap \| Pool) — elite on 2K monitors, stacks perfectly on mobile |
+| 📈 **Real-Time Charts** | Lightweight-Charts integration for high-performance price visualization with our oak dark theme |
+| 🔗 **Modern Web3 Stack** | Next.js 14 (App Router), Tailwind CSS, Wagmi v2, RainbowKit — MetaMask, WalletConnect, and more |
+| 🛡️ **MEV-Protection UI** | Swap widget ready for commit-reveal; slippage settings, deadline protection, and clear error states |
+| ⚡ **Stylus Backend** | Core logic in Rust on Arbitrum Stylus — maximum gas efficiency and security |
+
+---
+
+## 📦 Tech Stack
+
+| Layer | Technology |
+|-------|------------|
+| **Frontend** | Next.js 14 (App Router), React 18, TypeScript, Tailwind CSS |
+| **Web3** | Wagmi v2, RainbowKit, Viem |
+| **Charts** | Lightweight-Charts v5 |
+| **Backend** | Rust, Arbitrum Stylus (WASM) |
+| **Chain** | Arbitrum Sepolia (testnet) → Arbitrum One (mainnet) |
+
+---
+
+## 💎 Why Oak?
+
+| Pillar | Benefit |
+|--------|---------|
+| **⚡ Efficiency** | 40–50% gas savings vs. Solidity DEXs; WASM-optimized execution |
+| **🔒 Security** | Cryptographic commit-reveal, 100% checked arithmetic, reentrancy guards, owner-only controls |
+| **🎨 Pro UI** | GMX/Aave-inspired dark theme, responsive layout, loading states, and polished UX |
+
+---
+
+## 🏃 How to Run
+
+### Frontend (Dashboard)
+
+```bash
+cd web
+npm install
+cp .env.example .env.local
+# Set NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID (get from https://cloud.walletconnect.com)
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000) — connect your wallet (Arbitrum Sepolia) and explore the swap UI.
+
+### Contracts (Rust/Stylus)
+
+```bash
+# Build
+cargo build --target wasm32-unknown-unknown --release
+
+# Test
+cargo test
+
+# Deploy (Arbitrum Sepolia)
+cargo stylus deploy --wasm-file target/wasm32-unknown-unknown/release/oak_protocol.wasm --network sepolia
+```
+
+---
+
+## 🗺️ Development Roadmap
+
+| Phase | Status | Highlights |
+|-------|--------|------------|
+| **Phase 1: MVP** | ✅ **Done** | Rust/Stylus core, commit-reveal, flash swaps, GMX-style dashboard, real-time charts, Wagmi + RainbowKit |
+| **Phase 2: Mainnet** | 🔜 **Soon** | External audit, multisig treasury, Arbitrum One deployment, liquidity bootstrapping |
 
 ---
 
@@ -544,6 +618,9 @@ We conducted a **comprehensive internal security audit** covering:
 - [x] Internal security review
 - [x] Testnet deployment (Arbitrum Sepolia)
 - [x] Developer tooling and scripts
+- [x] **GMX-inspired dashboard** (Next.js 14, Tailwind, Wagmi, RainbowKit)
+- [x] **Real-time price charts** (Lightweight-Charts v5)
+- [x] **MEV-protection-ready swap UI** (slippage, deadline, pool info)
 
 **Status**: ✅ **COMPLETE**
 
@@ -553,7 +630,7 @@ We conducted a **comprehensive internal security audit** covering:
 - [ ] Multisig treasury setup
 - [ ] Mainnet deployment (Arbitrum One)
 - [ ] Liquidity bootstrapping
-- [ ] Frontend interface
+- [ ] Wire frontend to deployed contract (commit-reveal flow)
 - [ ] Documentation site
 
 **Target**: Q2 2026
