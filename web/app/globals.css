@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --oak-bg: #0a0a0b;
+  --oak-bg-elevated: #121214;
+  --oak-bg-card: #161618;
+  --oak-border: #2a2a2e;
+  --oak-text: #fafafa;
+  --oak-text-secondary: #a1a1aa;
+  --oak-accent: #22c55e;
+}
+
+html {
+  @apply antialiased;
+}
+
+body {
+  @apply bg-oak-bg text-oak-text-primary min-h-screen;
+}
+
+/* Subtle focus ring for accessibility */
+*:focus-visible {
+  @apply outline-none ring-2 ring-oak-accent ring-offset-2 ring-offset-oak-bg;
+}
+
+/* Smooth scroll */
+html {
+  scroll-behavior: smooth;
+}
+
+/* Custom scrollbar for dark theme */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-oak-bg-elevated;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-oak-border rounded-full;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-oak-text-muted;
+}

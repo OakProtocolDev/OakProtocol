@@ -1,0 +1,22 @@
+import type { Metadata } from "next";
+import { Providers } from "./providers";
+import "./globals.css";
+
+export const metadata: Metadata = {
+  title: "Oak Protocol | Decentralized Exchange on Arbitrum",
+  description: "MEV-protected DEX with commit-reveal swaps on Arbitrum Stylus",
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html lang="en" className="dark">
+      <body className="font-sans bg-oak-bg text-oak-text-primary min-h-screen">
+        <Providers>{children}</Providers>
+      </body>
+    </html>
+  );
+}
