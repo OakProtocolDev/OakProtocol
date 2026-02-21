@@ -14,8 +14,10 @@ export interface SwapWidgetProps {
   token1Symbol?: string;
   /** User balance for token0 (from hooks/utils) */
   token0Balance?: string;
-  /** Estimated output for token1 (from hooks/utils) */
+  /** Estimated output for token1 (from hooks/utils). Overridden by marketPrice when swapping base->quote. */
   estimatedOutput?: string;
+  /** Live market price (e.g. from Binance). When set, output = amountIn * marketPrice for base->quote swap. */
+  marketPrice?: string | null;
   /** Loading state for quote */
   isLoadingQuote?: boolean;
   /** Swap handler - implement via hooks */
@@ -29,6 +31,7 @@ export function SwapWidget({
   token1Symbol = "TOKEN1",
   token0Balance = "0",
   estimatedOutput = "0",
+  marketPrice = null,
   isLoadingQuote = false,
   onSwap,
   error = null,
@@ -41,9 +44,16 @@ export function SwapWidget({
 
   const effectiveSlippage = slippage === "custom" ? customSlippage : slippage;
   const numericSlippage = parseFloat(effectiveSlippage) || 0;
+
+  // Use market price for output when swapping base (ETH) -> quote (USDC)
+  const computedOutput =
+    marketPrice && amountIn && parseFloat(amountIn) > 0
+      ? (parseFloat(amountIn) * parseFloat(marketPrice)).toFixed(6)
+      : estimatedOutput;
+  const displayOutput = marketPrice ? computedOutput : estimatedOutput;
   const minAmountOut =
-    estimatedOutput && amountIn
-      ? (parseFloat(estimatedOutput) * (1 - numericSlippage / 100)).toFixed(6)
+    displayOutput && amountIn
+      ? (parseFloat(displayOutput) * (1 - numericSlippage / 100)).toFixed(6)
       : "0";
 
   const handleMax = () => {
@@ -120,10 +130,10 @@ export function SwapWidget({
           </div>
           <div className="mt-2 flex items-center justify-between gap-2">
             <div className="min-w-0 flex-1 text-2xl font-medium text-oak-text-primary">
-              {isLoadingQuote ? (
+              {isLoadingQuote && !marketPrice ? (
                 <span className="inline-block h-8 w-24 animate-pulse rounded bg-oak-border" />
               ) : (
-                estimatedOutput || "0.0"
+                displayOutput || "0.0"
               )}
             </div>
             <span className="rounded-md bg-oak-bg-hover px-3 py-1.5 text-sm font-medium text-oak-text-primary">
