@@ -3,13 +3,20 @@
 @tailwind utilities;
 
 :root {
-  --oak-bg: #0a0a0b;
-  --oak-bg-elevated: #121214;
-  --oak-bg-card: #161618;
-  --oak-border: #2a2a2e;
+  --oak-bg: #050807;
+  --oak-bg-elevated: #0c1210;
+  --oak-bg-card: #0f1613;
+  --oak-border: #1a2520;
   --oak-text: #fafafa;
   --oak-text-secondary: #a1a1aa;
   --oak-accent: #22c55e;
+  --oak-emerald-900: #064e3b;
+  --oak-emerald-950: #022c22;
+  --oak-glass-bg: rgba(15, 22, 19, 0.6);
+  --oak-glass-border: rgba(34, 197, 94, 0.12);
+  --oak-glow: 0 0 20px rgba(34, 197, 94, 0.15);
+  --oak-glow-strong: 0 0 32px rgba(34, 197, 94, 0.25);
+  --oak-shadow-deep: 0 8px 32px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.3);
 }
 
 html {
@@ -17,7 +24,32 @@ html {
 }
 
 body {
-  @apply bg-oak-bg text-oak-text-primary min-h-screen;
+  @apply text-oak-text-primary min-h-screen relative overflow-x-hidden;
+  background: linear-gradient(
+    165deg,
+    #022c22 0%,
+    #064e3b 18%,
+    #050807 45%,
+    #030605 100%
+  );
+  background-attachment: fixed;
+}
+
+/* Premium noise/grain overlay - subtle animated texture */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  animation: grainPulse 12s ease-in-out infinite;
+  pointer-events: none;
+  z-index: 9999;
+  mix-blend-mode: overlay;
+}
+
+@keyframes grainPulse {
+  0%, 100% { opacity: 0.025; }
+  50% { opacity: 0.04; }
 }
 
 /* Subtle focus ring for accessibility */
@@ -25,25 +57,77 @@ body {
   @apply outline-none ring-2 ring-oak-accent ring-offset-2 ring-offset-oak-bg;
 }
 
-/* Smooth scroll */
 html {
   scroll-behavior: smooth;
 }
 
-/* Custom scrollbar for dark theme */
+/* Custom scrollbar - premium dark */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 
 ::-webkit-scrollbar-track {
-  @apply bg-oak-bg-elevated;
+  background: rgba(15, 22, 19, 0.5);
+  border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb {
-  @apply bg-oak-border rounded-full;
+  background: rgba(34, 197, 94, 0.2);
+  border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  @apply bg-oak-text-muted;
+  background: rgba(34, 197, 94, 0.35);
+}
+
+/* Glassmorphism utilities */
+@layer components {
+  .glass-card {
+    @apply rounded-oak-lg;
+    background: rgba(15, 22, 19, 0.55);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(34, 197, 94, 0.08);
+    box-shadow:
+      0 8px 32px rgba(0, 0, 0, 0.4),
+      0 2px 8px rgba(0, 0, 0, 0.2),
+      inset 0 1px 0 rgba(255, 255, 255, 0.02);
+  }
+
+  .glass-card-elevated {
+    @apply rounded-oak-lg;
+    background: rgba(15, 22, 19, 0.65);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    border: 1px solid rgba(34, 197, 94, 0.12);
+    box-shadow:
+      0 12px 40px rgba(0, 0, 0, 0.5),
+      0 4px 12px rgba(0, 0, 0, 0.25),
+      inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  }
+
+  .glass-input {
+    @apply rounded-oak transition-all duration-300;
+    background: rgba(12, 18, 16, 0.8);
+    border: 1px solid rgba(34, 197, 94, 0.1);
+  }
+
+  .glass-input:focus {
+    border-color: rgba(34, 197, 94, 0.4);
+    box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.15);
+  }
+
+  .stylus-glow {
+    box-shadow:
+      0 0 12px rgba(34, 197, 94, 0.25),
+      0 0 24px rgba(34, 197, 94, 0.1),
+      inset 0 0 12px rgba(34, 197, 94, 0.05);
+  }
+
+  .live-pulse-glow {
+    box-shadow:
+      0 0 8px rgba(34, 197, 94, 0.6),
+      0 0 16px rgba(34, 197, 94, 0.3);
+  }
 }

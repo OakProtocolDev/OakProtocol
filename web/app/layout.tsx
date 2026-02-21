@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Providers } from "./providers";
+import { PageTransition } from "@/components/PageTransition";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -14,8 +15,10 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className="dark">
-      <body className="font-sans bg-oak-bg text-oak-text-primary min-h-screen">
-        <Providers>{children}</Providers>
+      <body className="font-sans text-oak-text-primary min-h-screen">
+        <Providers>
+          <PageTransition>{children}</PageTransition>
+        </Providers>
       </body>
     </html>
   );

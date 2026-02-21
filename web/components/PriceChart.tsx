@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { motion } from "framer-motion";
 
-/** Line point for lightweight-charts (time as UTCTimestamp = seconds since epoch) */
 export interface ChartLinePoint {
   time: number;
   value: number;
@@ -15,17 +15,13 @@ export interface PriceChartProps {
 
 const CHART_HEIGHT = 260;
 const OAK_COLORS = {
-  bg: "#0a0a0b",
-  card: "#161618",
-  border: "#2a2a2e",
+  bg: "#050807",
+  card: "#0f1613",
+  border: "#1a2520",
   text: "#a1a1aa",
   accent: "#22c55e",
 } as const;
 
-/**
- * GMX-style dark line chart using oak palette.
- * Lightweight-charts is loaded only on the client to avoid "LineSeries is not defined" / addSeries SSR issues.
- */
 export function PriceChart({ data, height = CHART_HEIGHT }: PriceChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<ReturnType<typeof import("lightweight-charts").createChart> | null>(null);
@@ -99,7 +95,7 @@ export function PriceChart({ data, height = CHART_HEIGHT }: PriceChartProps) {
       seriesRef.current = series;
 
       if (data && data.length > 0) {
-        // @ts-expect-error lightweight-charts Time type is strict; our UTCTimestamp number is valid at runtime
+        // @ts-expect-error lightweight-charts Time type
         series.setData(data);
       }
 
@@ -133,12 +129,22 @@ export function PriceChart({ data, height = CHART_HEIGHT }: PriceChartProps) {
 
   useEffect(() => {
     if (!seriesRef.current || !data || data.length === 0) return;
-    // @ts-expect-error lightweight-charts Time type is strict; our UTCTimestamp number is valid at runtime
+    // @ts-expect-error lightweight-charts Time type
     seriesRef.current.setData(data);
   }, [data]);
 
   return (
-    <div className="w-full max-w-md rounded-oak-lg border border-oak-border bg-oak-bg-card shadow-oak">
+    <motion.div
+      initial={{ opacity: 0, y: 12 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.4, ease: [0.25, 0.46, 0.45, 0.94] }}
+      className="glass-card w-full max-w-md overflow-hidden"
+      style={{
+        background: "rgba(15, 22, 19, 0.55)",
+        backdropFilter: "blur(20px)",
+        border: "1px solid rgba(34, 197, 94, 0.08)",
+      }}
+    >
       <div className="flex items-center justify-between px-4 pt-4">
         <div>
           <h2 className="text-sm font-medium text-oak-text-secondary">Price Chart</h2>
@@ -148,10 +154,10 @@ export function PriceChart({ data, height = CHART_HEIGHT }: PriceChartProps) {
       <div className="mt-3 px-3 pb-4">
         <div
           ref={containerRef}
-          className="w-full rounded-md bg-oak-bg-elevated"
+          className="w-full rounded-md bg-oak-bg-elevated/50 transition-colors hover:bg-oak-bg-elevated/70"
           style={{ height: `${CHART_HEIGHT}px` }}
         />
       </div>
-    </div>
+    </motion.div>
   );
 }
