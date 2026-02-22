@@ -11,6 +11,7 @@ import {
   getPlaceholderPoolData,
   getPlaceholderSwapHandler,
 } from "@/lib/placeholders";
+import { useTradeStore, getDisplayBalance } from "@/store/useTradeStore";
 
 function getPlaceholderChartData(): ChartLinePoint[] {
   const base = Math.floor(Date.now() / 1000) - 24 * 3600;
@@ -24,6 +25,15 @@ export default function HomePage() {
   const poolData = useMemo(() => getPlaceholderPoolData(), []);
   const swapHandler = useMemo(() => getPlaceholderSwapHandler(), []);
   const placeholderChartData = useMemo(() => getPlaceholderChartData(), []);
+
+  const isDemoMode = useTradeStore((s) => s.isDemoMode);
+  const balances = useTradeStore((s) => s.balances);
+  const token0Balance = getDisplayBalance(
+    "ETH",
+    poolData.token0Balance,
+    isDemoMode,
+    balances
+  );
 
   return (
     <div className="flex min-h-screen flex-col">
@@ -47,11 +57,12 @@ export default function HomePage() {
             <SwapWidget
               token0Symbol={poolData.token0Symbol}
               token1Symbol={poolData.token1Symbol}
-              token0Balance={poolData.token0Balance}
+              token0Balance={token0Balance}
               estimatedOutput={poolData.estimatedOutput}
               isLoadingQuote={poolData.isLoadingQuote}
               onSwap={swapHandler}
               error={poolData.error}
+              isDemoMode={isDemoMode}
             />
           </motion.div>
           <motion.div

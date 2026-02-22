@@ -35,8 +35,8 @@ const config: Config = {
         },
       },
       fontFamily: {
-        sans: ["system-ui", "ui-sans-serif", "sans-serif"],
-        mono: ["ui-monospace", "monospace"],
+        sans: ["var(--font-inter)", "Inter", "system-ui", "ui-sans-serif", "sans-serif"],
+        mono: ["var(--font-jetbrains-mono)", "JetBrains Mono", "ui-monospace", "monospace"],
       },
       borderRadius: {
         oak: "12px",

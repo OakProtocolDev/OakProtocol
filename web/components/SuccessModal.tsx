@@ -1,6 +1,8 @@
 "use client";
 
+import { useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import confetti from "canvas-confetti";
 
 const ARBISCAN_BASE = "https://arbiscan.io/tx";
 
@@ -11,7 +13,29 @@ export interface SuccessModalProps {
   amountOut?: string;
   token0Symbol?: string;
   token1Symbol?: string;
+  /** When true, show DEMO badge and treat tx as simulated (realistic fake Arbiscan link). */
+  isDemo?: boolean;
   onClose: () => void;
+}
+
+/** Trigger a premium confetti burst (gold/green) when demo success. */
+function fireConfetti() {
+  const count = 120;
+  const defaults = { origin: { y: 0.6 }, zIndex: 9999 };
+
+  function fire(particleRatio: number, opts: confetti.Options) {
+    confetti({
+      ...defaults,
+      ...opts,
+      particleCount: Math.floor(count * particleRatio),
+    });
+  }
+
+  fire(0.25, { spread: 26, startVelocity: 55, colors: ["#22c55e", "#16a34a"] });
+  fire(0.2, { spread: 60, startVelocity: 45, colors: ["#f59e0b", "#fbbf24"] });
+  fire(0.35, { spread: 100, decay: 0.91, scalar: 0.8 });
+  fire(0.1, { spread: 120, startVelocity: 25, decay: 0.92, scalar: 1.2 });
+  fire(0.1, { spread: 120, startVelocity: 45 });
 }
 
 export function SuccessModal({
@@ -21,8 +45,20 @@ export function SuccessModal({
   amountOut = "0",
   token0Symbol = "ETH",
   token1Symbol = "USDC",
+  isDemo = false,
   onClose,
 }: SuccessModalProps) {
+  const hasFiredConfetti = useRef(false);
+
+  // Confetti on open (once per open)
+  useEffect(() => {
+    if (isOpen && !hasFiredConfetti.current) {
+      hasFiredConfetti.current = true;
+      fireConfetti();
+    }
+    if (!isOpen) hasFiredConfetti.current = false;
+  }, [isOpen]);
+
   const explorerUrl = `${ARBISCAN_BASE}/${txHash}`;
   const shareText = `Just swapped ${amountIn} ${token0Symbol} → ${amountOut} ${token1Symbol} on @OakProtocol 🍃 MEV-protected, Stylus-efficient. ${explorerUrl}`;
   const shareUrl = `https://twitter.com/intent/tweet?text=${encodeURIComponent(shareText)}`;
@@ -58,11 +94,25 @@ export function SuccessModal({
               }}
               onClick={(e) => e.stopPropagation()}
             >
-              {/* Subtle gradient accent at top */}
               <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-oak-accent/50 to-transparent" />
 
               <div className="p-6 sm:p-8">
-                {/* Success icon */}
+                {/* DEMO badge when simulated */}
+                {isDemo && (
+                  <div className="mb-3 flex justify-center">
+                    <span
+                      className="inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold"
+                      style={{
+                        background: "rgba(245, 158, 11, 0.2)",
+                        color: "#fbbf24",
+                        boxShadow: "0 0 12px rgba(245, 158, 11, 0.3)",
+                      }}
+                    >
+                      DEMO
+                    </span>
+                  </div>
+                )}
+
                 <motion.div
                   initial={{ scale: 0 }}
                   animate={{ scale: 1 }}
@@ -88,10 +138,11 @@ export function SuccessModal({
                   Transaction Successful
                 </h2>
                 <p className="mt-1 text-center text-sm text-oak-text-secondary">
-                  Your swap was MEV-protected via commit-reveal
+                  {isDemo
+                    ? "Simulated swap completed (Demo Mode)"
+                    : "Your swap was MEV-protected via commit-reveal"}
                 </p>
 
-                {/* Swap summary */}
                 <div className="mt-5 rounded-oak border border-oak-border bg-oak-bg-elevated p-4">
                   <div className="flex items-center justify-between text-sm">
                     <span className="text-oak-text-muted">{token0Symbol}</span>
@@ -110,7 +161,6 @@ export function SuccessModal({
                   </div>
                 </div>
 
-                {/* Tx hash link */}
                 <a
                   href={explorerUrl}
                   target="_blank"
@@ -135,7 +185,6 @@ export function SuccessModal({
                   </svg>
                 </a>
 
-                {/* Actions */}
                 <div className="mt-5 flex gap-3">
                   <motion.a
                     href={shareUrl}

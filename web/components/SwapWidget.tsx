@@ -8,6 +8,15 @@ export type SlippageOption = "0.1" | "0.5" | "1" | "custom";
 
 const SLIPPAGE_PRESETS: SlippageOption[] = ["0.1", "0.5", "1"];
 
+/** Market source for liquidity — simulates GMX/AAVE discovery. */
+export type MarketSource = "oak" | "gmx" | "aave";
+
+const MARKET_SOURCES: { id: MarketSource; label: string }[] = [
+  { id: "oak", label: "Oak Native (Stylus)" },
+  { id: "gmx", label: "GMX V2" },
+  { id: "aave", label: "Aave V3" },
+];
+
 export interface SwapWidgetProps {
   token0Symbol?: string;
   token1Symbol?: string;
@@ -17,11 +26,13 @@ export interface SwapWidgetProps {
   isLoadingQuote?: boolean;
   onSwap?: (amountIn: string, minAmountOut: string, deadline: number) => Promise<void>;
   error?: string | null;
+  /** When true, Swap is allowed without wallet (demo mode). */
+  isDemoMode?: boolean;
 }
 
 const springTap = {
   scale: 0.98,
-  transition: { type: "spring", stiffness: 500, damping: 30 },
+  transition: { type: "spring" as const, stiffness: 500, damping: 30 },
 };
 
 export function SwapWidget({
@@ -33,13 +44,17 @@ export function SwapWidget({
   isLoadingQuote = false,
   onSwap,
   error = null,
+  isDemoMode = false,
 }: SwapWidgetProps) {
   const { isConnected } = useAccount();
+  const canSwap = isConnected || isDemoMode;
   const [amountIn, setAmountIn] = useState("");
   const [slippage, setSlippage] = useState<SlippageOption>("0.5");
   const [customSlippage, setCustomSlippage] = useState("");
   const [isSwapping, setIsSwapping] = useState(false);
   const [inputFocused, setInputFocused] = useState(false);
+  const [marketSource, setMarketSource] = useState<MarketSource>("oak");
+  const [leverage, setLeverage] = useState(1);
   const inputRef = useRef<HTMLDivElement>(null);
 
   const effectiveSlippage = slippage === "custom" ? customSlippage : slippage;
@@ -74,11 +89,13 @@ export function SwapWidget({
   };
 
   const isValid =
-    isConnected &&
+    canSwap &&
     amountIn &&
     parseFloat(amountIn) > 0 &&
     parseFloat(amountIn) <= parseFloat(token0Balance) &&
     !isSwapping;
+
+  const showLeverage = marketSource === "gmx";
 
   return (
     <motion.div
@@ -93,6 +110,62 @@ export function SwapWidget({
     >
       <div className="p-5 sm:p-6">
         <h2 className="mb-4 text-lg font-medium text-oak-text-primary">Swap</h2>
+
+        {/* Market Source selector — Oak / GMX V2 / Aave V3 */}
+        <div className="mb-4">
+          <span className="mb-2 block text-xs font-medium text-oak-text-muted">
+            Market Source
+          </span>
+          <div className="flex gap-2 rounded-oak border border-oak-border/60 bg-oak-bg-elevated/50 p-1 backdrop-blur-sm">
+            {MARKET_SOURCES.map(({ id, label }) => (
+              <motion.button
+                key={id}
+                type="button"
+                onClick={() => setMarketSource(id)}
+                whileTap={springTap}
+                className={`flex-1 rounded-md px-2 py-2 text-xs font-medium transition-all ${
+                  marketSource === id
+                    ? "bg-oak-accent/20 text-oak-accent shadow-sm"
+                    : "text-oak-text-secondary hover:text-oak-text-primary"
+                }`}
+              >
+                {label}
+              </motion.button>
+            ))}
+          </div>
+        </div>
+
+        {/* GMX Leverage slider — glassmorphism, 1x–50x */}
+        {showLeverage && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: "auto" }}
+            exit={{ opacity: 0, height: 0 }}
+            transition={{ duration: 0.3 }}
+            className="mb-4 rounded-oak border border-oak-border/50 bg-white/[0.03] p-4 backdrop-blur-md"
+            style={{
+              boxShadow: "inset 0 1px 0 rgba(255,255,255,0.03)",
+            }}
+          >
+            <div className="flex items-center justify-between text-xs text-oak-text-secondary">
+              <span>Leverage</span>
+              <span className="font-mono font-medium text-oak-text-primary">
+                {leverage}x
+              </span>
+            </div>
+            <input
+              type="range"
+              min={1}
+              max={50}
+              value={leverage}
+              onChange={(e) => setLeverage(Number(e.target.value))}
+              className="mt-2 h-2 w-full appearance-none rounded-full bg-oak-border/60 accent-oak-accent"
+              style={{
+                background: `linear-gradient(to right, rgba(34, 197, 94, 0.5) 0%, rgba(34, 197, 94, 0.5) ${((leverage - 1) / 49) * 100}%, rgba(26, 37, 32, 0.8) ${((leverage - 1) / 49) * 100}%, rgba(26, 37, 32, 0.8) 100%)`,
+              }}
+            />
+          </motion.div>
+        )}
 
         {/* Token0 Input - Tactile with focus glow */}
         <motion.div
@@ -231,7 +304,7 @@ export function SwapWidget({
           isSwapping={isSwapping}
           amountIn={amountIn}
           token0Balance={token0Balance}
-          isConnected={!!isConnected}
+          isConnected={!!canSwap}
           onSwap={handleSwap}
         />
       </div>
@@ -277,7 +350,6 @@ function ShimmerSwapButton({
           : "rgb(34, 197, 94, 0.4)",
       }}
     >
-      {/* Shimmer overlay - passes every ~3s */}
       {isValid && (
         <span className="absolute inset-0 overflow-hidden">
           <span className="absolute inset-y-0 w-[40%] bg-gradient-to-r from-transparent via-white/30 to-transparent animate-shimmer" />
