@@ -24,6 +24,10 @@ pub mod state;
 pub mod logic;
 /// ERC-20 token interface and transfer utilities.
 pub mod token;
+/// GMX-style vault logic (swap, leverage); internal use by OakSentinel.
+pub mod vault;
+/// Randomness utilities for Oak Bet (casino).
+pub mod rng;
 
 /// Entry point for the Oak Protocol contract.
 ///

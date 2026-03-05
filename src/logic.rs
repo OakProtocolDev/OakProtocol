@@ -5,22 +5,21 @@ use alloc::vec::Vec;
 use stylus_sdk::{
     alloy_primitives::{Address, FixedBytes, U256},
     block,
-    call::Call,
     contract,
     crypto,
     msg,
-    prelude::*,
 };
 
 use crate::{
     constants::{
-        as_u256, q112_u256, COMMIT_REVEAL_DELAY, DEFAULT_FEE_BPS, FEE_DENOMINATOR,
-        GAS_REBATE_BPS, MAX_COMMITMENT_AGE, MAX_FEE_BPS, MINIMUM_LIQUIDITY, TREASURY_FEE_BPS,
+        as_u256, q112_u256, COMMIT_REVEAL_DELAY, DEFAULT_FEE_BPS, FEE_DENOMINATOR, GAS_REBATE_BPS,
+        INITIAL_FEE, MAX_COMMITMENT_AGE, MAX_FEE_BPS, MINIMUM_LIQUIDITY, TREASURY_FEE_BPS,
     },
     errors::*,
     events::{
         emit_add_liquidity, emit_cancel_commitment, emit_commit_swap, emit_flash_swap,
-        emit_pause_changed, emit_reveal_swap, emit_set_fee, emit_withdraw_treasury_fees,
+        emit_lp_transfer, emit_pause_changed, emit_reveal_swap, emit_set_fee,
+        emit_withdraw_treasury_fees,
     },
     state::OakDEX,
     token::{balance_of, safe_transfer, safe_transfer_from},
@@ -145,6 +144,166 @@ fn update_oracle(dex: &mut OakDEX, reserve0: U256, reserve1: U256) -> OakResult<
     Ok(())
 }
 
+/// Core swap processing: invariant math, slippage protection, fee accounting and transfers.
+///
+/// @notice Internal helper used by entrypoints that perform a swap.
+/// @dev Applies strict slippage checks, uses fully checked arithmetic, and
+///      accrues protocol fees to the admin (treasury) accounting bucket.
+fn process_swap(
+    dex: &mut OakDEX,
+    token0: Address,
+    token1: Address,
+    amount_in: U256,
+    min_amount_out: U256,
+) -> OakResult<U256> {
+    // Input sanitization: validate addresses
+    require_non_zero_address(token0)?;
+    require_non_zero_address(token1)?;
+
+    // Input sanitization: validate amounts
+    if amount_in.is_zero() {
+        return Err(err(ERR_INSUFFICIENT_INPUT_AMOUNT));
+    }
+    if min_amount_out.is_zero() {
+        return Err(err(ERR_INSUFFICIENT_OUTPUT_AMOUNT));
+    }
+
+    // Emergency circuit breaker
+    require_not_paused(dex)?;
+
+    let sender = msg::sender();
+
+    // Balance check: ensure user has enough tokens before attempting transfer.
+    let user_balance = balance_of(token0, sender);
+    if user_balance < amount_in {
+        return Err(err(ERR_INSUFFICIENT_BALANCE));
+    }
+
+    // Snapshot pool reserves and fee configuration.
+    let (pool_token0, pool_token1) = if token0 < token1 {
+        (token0, token1)
+    } else {
+        (token1, token0)
+    };
+    // First, read reserves via a short-lived mutable borrow.
+    let (reserve0, reserve1) = {
+        let mut outer = dex.pools.setter(pool_token0);
+        let pool = outer.setter(pool_token1);
+        if !pool.initialized.get() {
+            return Err(err(ERR_INVALID_TOKEN));
+        }
+        (pool.reserve0.get(), pool.reserve1.get())
+    };
+    let fee_bps = dex.protocol_fee_bps.get();
+
+    // TWAP oracle: update cumulative prices at the beginning of every swap.
+    update_oracle(dex, reserve0, reserve1)?;
+
+    // Determine direction within the pool and compute amount_out.
+    let (reserve_in, reserve_out) = if token0 == pool_token0 {
+        (reserve0, reserve1)
+    } else {
+        (reserve1, reserve0)
+    };
+
+    let amount_out = get_amount_out_with_fee(amount_in, reserve_in, reserve_out, fee_bps)?;
+
+    // Strict slippage protection: revert if actual output below minimum.
+    if amount_out < min_amount_out {
+        return Err(err(ERR_SLIPPAGE_EXCEEDED));
+    }
+
+    // Compute fee split for analytics and treasury accounting.
+    let (_effective_in, treasury_fee, lp_fee) = compute_fee_split(amount_in, fee_bps)?;
+
+    // Update reserves under the standard CPMM assumption.
+    let new_reserve_in = reserve_in
+        .checked_add(amount_in)
+        .ok_or_else(|| err(ERR_RESERVE0_OVERFLOW))?;
+
+    let new_reserve_out = reserve_out
+        .checked_sub(amount_out)
+        .ok_or_else(|| err(ERR_INSUFFICIENT_LIQUIDITY))?;
+
+    let min_liquidity = dex.min_liquidity.get();
+
+    let (new_reserve0, new_reserve1) = if token0 == pool_token0 {
+        (new_reserve_in, new_reserve_out)
+    } else {
+        (new_reserve_out, new_reserve_in)
+    };
+
+    if new_reserve0 < min_liquidity || new_reserve1 < min_liquidity {
+        return Err(err(ERR_INSUFFICIENT_LIQUIDITY));
+    }
+
+    {
+        let mut outer = dex.pools.setter(pool_token0);
+        let mut pool = outer.setter(pool_token1);
+        pool.reserve0.set(new_reserve0);
+        pool.reserve1.set(new_reserve1);
+    }
+
+    // Update analytics and accounting.
+    let current_volume0 = dex.total_volume_token0.get();
+    let current_volume1 = dex.total_volume_token1.get();
+
+    let new_volume0 = current_volume0
+        .checked_add(amount_in)
+        .ok_or_else(|| err(ERR_VOLUME_OVERFLOW))?;
+
+    let new_volume1 = current_volume1
+        .checked_add(amount_out)
+        .ok_or_else(|| err(ERR_VOLUME_OVERFLOW))?;
+
+    dex.total_volume_token0.set(new_volume0);
+    dex.total_volume_token1.set(new_volume1);
+
+    let current_treasury_fees = dex.accrued_treasury_fees_token0.get();
+    let current_lp_fees = dex.accrued_lp_fees_token0.get();
+
+    let new_treasury_fees = current_treasury_fees
+        .checked_add(treasury_fee)
+        .ok_or_else(|| err(ERR_OVERFLOW))?;
+    let new_lp_fees = current_lp_fees
+        .checked_add(lp_fee)
+        .ok_or_else(|| err(ERR_OVERFLOW))?;
+
+    dex.accrued_treasury_fees_token0.set(new_treasury_fees);
+    dex.accrued_lp_fees_token0.set(new_lp_fees);
+
+    // Gas-rebate placeholder: track a small portion of protocol fee for future gas rebates.
+    let total_fee = treasury_fee
+        .checked_add(lp_fee)
+        .ok_or_else(|| err(ERR_OVERFLOW))?;
+    let gas_rebate = total_fee
+        .checked_mul(as_u256(GAS_REBATE_BPS))
+        .ok_or_else(|| err(ERR_OVERFLOW))?
+        .checked_div(as_u256(FEE_DENOMINATOR))
+        .ok_or_else(|| err(ERR_DIVISION_BY_ZERO))?;
+    if !gas_rebate.is_zero() {
+        let acc = dex.accrued_gas_rebate_token0.get();
+        let new_acc = acc
+            .checked_add(gas_rebate)
+            .ok_or_else(|| err(ERR_OVERFLOW))?;
+        dex.accrued_gas_rebate_token0.set(new_acc);
+    }
+
+    // Transfer tokens: user -> contract (token0)
+    let contract_addr = contract::address();
+    safe_transfer_from(token0, sender, contract_addr, amount_in)?;
+
+    // Transfer tokens: contract -> user (token1)
+    safe_transfer(token1, sender, amount_out)?;
+
+    // Emit swap event with fee split; admin wallet (treasury) can later withdraw
+    // its share via `withdraw_treasury_fees`, which transfers directly to the
+    // configured treasury address.
+    emit_reveal_swap(sender, amount_in, amount_out, treasury_fee, lp_fee);
+
+    Ok(amount_out)
+}
+
 /// Pure CPMM math with a configurable total fee.
 ///
 /// @notice Computes constant‑product output amount for a given input.
@@ -160,6 +319,19 @@ pub fn get_amount_out_with_fee(
 ) -> OakResult<U256> {
     if amount_in.is_zero() || reserve_in.is_zero() || reserve_out.is_zero() {
         return Err(err(ERR_INSUFFICIENT_INPUT_AMOUNT));
+    }
+
+    // If the effective fee rounds down to zero for this trade size,
+    // treat it as "dust": the input is too small to produce a meaningful
+    // output under the configured fee. In this case we return 0 instead
+    // of reverting, so callers can decide whether to proceed.
+    let total_fee = amount_in
+        .checked_mul(fee_bps)
+        .ok_or_else(|| err(ERR_OVERFLOW))?
+        .checked_div(as_u256(FEE_DENOMINATOR))
+        .ok_or_else(|| err(ERR_DIVISION_BY_ZERO))?;
+    if !fee_bps.is_zero() && total_fee.is_zero() {
+        return Ok(U256::ZERO);
     }
 
     let fee_multiplier = as_u256(FEE_DENOMINATOR)
@@ -238,12 +410,79 @@ pub fn compute_fee_split(amount_in: U256, fee_bps: U256) -> OakResult<(U256, U25
     Ok((effective_in, treasury_fee, lp_fee))
 }
 
+/// Integer square root for `U256` (floor).
+///
+/// @notice Returns `floor(sqrt(x))` using a Babylonian-style iteration.
+/// @dev This is used for initial LP token minting: sqrt(amount0 * amount1).
+fn u256_sqrt(x: U256) -> U256 {
+    if x.is_zero() {
+        return U256::ZERO;
+    }
+
+    // Initial approximation: x/2 + 1
+    let mut z = x;
+    let mut y = (x >> 1) + U256::from(1u64);
+
+    while y < z {
+        z = y;
+        y = (x.checked_div(y).unwrap_or(U256::ZERO) + y) >> 1;
+    }
+
+    z
+}
+
 /// Public contract functions implementation.
 ///
 /// @notice Core entrypoints exposed to external callers.
 /// @dev These methods operate on Stylus storage types defined in `state`.
+///      This block is only compiled for on-chain (wasm32) builds; host
+///      tests use the pure helper functions above instead.
+#[cfg(all(not(test), target_arch = "wasm32"))]
 #[public]
 impl OakDEX {
+    /// Create a new pool for a token pair.
+    ///
+    /// @notice Anyone can create a pool, but each canonical pair (token0, token1)
+    ///         can only be initialized once.
+    pub fn create_pool(&mut self, token_a: Address, token_b: Address) -> OakResult<()> {
+        // Re-entrancy guard
+        lock_reentrancy_guard(self)?;
+
+        require_non_zero_address(token_a)?;
+        require_non_zero_address(token_b)?;
+        if token_a == token_b {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INVALID_TOKEN));
+        }
+
+        // Canonical ordering
+        let (token0, token1) = if token_a < token_b {
+            token_a
+        } else {
+            token_b
+        };
+        let token1 = if token_a < token_b { token_b } else { token_a };
+
+        // Access pool storage
+        let mut outer = self.pools.setter(token0);
+        let mut pool = outer.setter(token1);
+
+        if pool.initialized.get() {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_POOL_EXISTS));
+        }
+
+        // Initialize empty pool
+        pool.reserve0.set(U256::ZERO);
+        pool.reserve1.set(U256::ZERO);
+        pool.lp_total_supply.set(U256::ZERO);
+        pool.initialized.set(true);
+
+        // Release guard
+        unlock_reentrancy_guard(self);
+
+        Ok(())
+    }
     /// Initialize the contract.
     ///
     /// @notice One‑time initializer setting owner, treasury, and default fee.
@@ -264,8 +503,9 @@ impl OakDEX {
         self.owner.set(initial_owner);
         self.treasury.set(treasury);
 
-        // Set default total fee (0.3%).
-        self.protocol_fee_bps.set(as_u256(DEFAULT_FEE_BPS));
+        // Set initial total fee (0.5%) for the first month after launch.
+        // Governance can later reduce this to `DEFAULT_FEE_BPS` via `set_fee`.
+        self.protocol_fee_bps.set(as_u256(INITIAL_FEE));
 
         // Initialize analytics and fee accounting.
         self.total_volume_token0.set(U256::ZERO);
@@ -462,146 +702,18 @@ impl OakDEX {
         self.commitment_activated.setter(sender).set(false);
         self.commitment_hashes.setter(sender).set(U256::ZERO);
 
-        // Snapshot reserves and fee configuration.
-        let reserve0 = self.reserves0.get();
-        let reserve1 = self.reserves1.get();
-        let fee_bps = self.protocol_fee_bps.get();
-
-        // TWAP oracle: update cumulative prices at the beginning of every swap.
-        if let Err(e) = update_oracle(self, reserve0, reserve1) {
-            unlock_reentrancy_guard(self);
-            return Err(e);
-        }
-
-        // Compute amount_out using CPMM with total fee.
-        let amount_out = match get_amount_out_with_fee(amount_in, reserve0, reserve1, fee_bps) {
-            Ok(out) => out,
+        // Execute the actual swap with invariant checks, slippage protection,
+        // and fee accounting. All math and external calls are performed inside
+        // `process_swap`, which uses fully checked arithmetic and accrues
+        // treasury fees for the admin wallet.
+        let result = process_swap(self, token0, token1, amount_in, min_amount_out);
+        let amount_out = match result {
+            Ok(v) => v,
             Err(e) => {
                 unlock_reentrancy_guard(self);
                 return Err(e);
             }
         };
-
-        // Strict slippage protection: revert with SlippageExceeded if actual output below minimum.
-        if amount_out < min_amount_out {
-            unlock_reentrancy_guard(self);
-            return Err(err(ERR_SLIPPAGE_EXCEEDED));
-        }
-
-        // Compute fee split for analytics and treasury accounting.
-        let (_effective_in, treasury_fee, lp_fee) = match compute_fee_split(amount_in, fee_bps) {
-            Ok(split) => split,
-            Err(e) => {
-                unlock_reentrancy_guard(self);
-                return Err(e);
-            }
-        };
-
-        // Update reserves under the standard CPMM assumption.
-        let new_reserve0 = reserve0
-            .checked_add(amount_in)
-            .ok_or_else(|| {
-                unlock_reentrancy_guard(self);
-                err(ERR_RESERVE0_OVERFLOW)
-            })?;
-
-        let new_reserve1 = reserve1
-            .checked_sub(amount_out)
-            .ok_or_else(|| {
-                unlock_reentrancy_guard(self);
-                err(ERR_INSUFFICIENT_LIQUIDITY)
-            })?;
-
-        let min_liquidity = self.min_liquidity.get();
-        if new_reserve0 < min_liquidity || new_reserve1 < min_liquidity {
-            unlock_reentrancy_guard(self);
-            return Err(err(ERR_INSUFFICIENT_LIQUIDITY));
-        }
-
-        self.reserves0.set(new_reserve0);
-        self.reserves1.set(new_reserve1);
-
-        // Update analytics and accounting.
-        let current_volume0 = self.total_volume_token0.get();
-        let current_volume1 = self.total_volume_token1.get();
-
-        let new_volume0 = current_volume0
-            .checked_add(amount_in)
-            .ok_or_else(|| {
-                unlock_reentrancy_guard(self);
-                err(ERR_VOLUME_OVERFLOW)
-            })?;
-
-        let new_volume1 = current_volume1
-            .checked_add(amount_out)
-            .ok_or_else(|| {
-                unlock_reentrancy_guard(self);
-                err(ERR_VOLUME_OVERFLOW)
-            })?;
-
-        self.total_volume_token0.set(new_volume0);
-        self.total_volume_token1.set(new_volume1);
-
-        let current_treasury_fees = self.accrued_treasury_fees_token0.get();
-        let current_lp_fees = self.accrued_lp_fees_token0.get();
-
-        let new_treasury_fees = current_treasury_fees
-            .checked_add(treasury_fee)
-            .ok_or_else(|| {
-                unlock_reentrancy_guard(self);
-                err(ERR_OVERFLOW)
-            })?;
-        let new_lp_fees = current_lp_fees
-            .checked_add(lp_fee)
-            .ok_or_else(|| {
-                unlock_reentrancy_guard(self);
-                err(ERR_OVERFLOW)
-            })?;
-
-        self.accrued_treasury_fees_token0.set(new_treasury_fees);
-        self.accrued_lp_fees_token0.set(new_lp_fees);
-
-        // Gas-rebate placeholder: track a small portion of protocol fee for future gas rebates.
-        let total_fee = treasury_fee
-            .checked_add(lp_fee)
-            .ok_or_else(|| {
-                unlock_reentrancy_guard(self);
-                err(ERR_OVERFLOW)
-            })?;
-        let gas_rebate = total_fee
-            .checked_mul(as_u256(GAS_REBATE_BPS))
-            .ok_or_else(|| {
-                unlock_reentrancy_guard(self);
-                err(ERR_OVERFLOW)
-            })?
-            .checked_div(as_u256(FEE_DENOMINATOR))
-            .ok_or_else(|| {
-                unlock_reentrancy_guard(self);
-                err(ERR_DIVISION_BY_ZERO)
-            })?;
-        if !gas_rebate.is_zero() {
-            let acc = self.accrued_gas_rebate_token0.get();
-            let new_acc = acc.checked_add(gas_rebate).ok_or_else(|| {
-                unlock_reentrancy_guard(self);
-                err(ERR_OVERFLOW)
-            })?;
-            self.accrued_gas_rebate_token0.set(new_acc);
-        }
-
-        // Transfer tokens: user -> contract (token0)
-        let contract_addr = contract::address();
-        if let Err(e) = safe_transfer_from(token0, sender, contract_addr, amount_in) {
-            unlock_reentrancy_guard(self);
-            return Err(e);
-        }
-
-        // Transfer tokens: contract -> user (token1)
-        if let Err(e) = safe_transfer(token1, sender, amount_out) {
-            unlock_reentrancy_guard(self);
-            return Err(e);
-        }
-
-        emit_reveal_swap(sender, amount_in, amount_out, treasury_fee, lp_fee);
 
         // CRITICAL: Release re-entrancy guard at the VERY END
         // This must be the last operation before return
@@ -649,51 +761,97 @@ impl OakDEX {
 
         require_not_paused(self)?;
 
-        let reserve0 = self.reserves0.get();
-        let reserve1 = self.reserves1.get();
-        let min_liquidity = self.min_liquidity.get();
-
-        // TWAP oracle: update cumulative prices at the beginning of every add_liquidity.
-        if let Err(e) = update_oracle(self, reserve0, reserve1) {
+        // Canonicalize token ordering for pool key.
+        let (pool_token0, pool_token1) = if token0 < token1 {
+            (token0, token1)
+        } else {
+            (token1, token0)
+        };
+        let outer = self.pools.setter(pool_token0);
+        let pool = outer.setter(pool_token1);
+        if !pool.initialized.get() {
             unlock_reentrancy_guard(self);
-            return Err(e);
+            return Err(err(ERR_INVALID_TOKEN));
         }
 
-        let new_reserve0 = reserve0
-            .checked_add(amount0)
-            .ok_or_else(|| {
-                unlock_reentrancy_guard(self);
-                err(ERR_RESERVE0_OVERFLOW)
-            })?;
+        // Map provided amounts into canonical order.
+        let (amount0_c, amount1_c) = if token0 == pool_token0 {
+            (amount0, amount1)
+        } else {
+            (amount1, amount0)
+        };
 
-        let new_reserve1 = reserve1
-            .checked_add(amount1)
-            .ok_or_else(|| {
-                unlock_reentrancy_guard(self);
-                err(ERR_RESERVE1_OVERFLOW)
-            })?;
+        let reserve0 = pool.reserve0.get();
+        let reserve1 = pool.reserve1.get();
+        let total_supply = pool.lp_total_supply.get();
 
-        let total_liquidity = new_reserve0
-            .checked_add(new_reserve1)
-            .ok_or_else(|| {
-                unlock_reentrancy_guard(self);
-                err(ERR_LIQUIDITY_OVERFLOW)
-            })?;
+        // Compute LP tokens to mint, following Uniswap V2 semantics.
+        // First liquidity: liquidity = sqrt(amount0 * amount1) - MINIMUM_LIQUIDITY
+        // Subsequent: min(amount0 * totalSupply / reserve0, amount1 * totalSupply / reserve1)
+        let liquidity = if total_supply.is_zero() {
+            let product = amount0_c
+                .checked_mul(amount1_c)
+                .ok_or_else(|| {
+                    unlock_reentrancy_guard(self);
+                    err(ERR_LIQUIDITY_OVERFLOW)
+                })?;
+            let sqrt = u256_sqrt(product);
+            let min_lp = as_u256(MINIMUM_LIQUIDITY);
 
-        if min_liquidity.is_zero() {
-            let min_liq = as_u256(MINIMUM_LIQUIDITY);
-            self.min_liquidity.set(min_liq);
-
-            if total_liquidity < min_liq {
+            if sqrt <= min_lp {
                 unlock_reentrancy_guard(self);
                 return Err(err(ERR_INSUFFICIENT_LIQUIDITY));
             }
-        } else if new_reserve0 < min_liquidity || new_reserve1 < min_liquidity {
-            unlock_reentrancy_guard(self);
-            return Err(err(ERR_INSUFFICIENT_LIQUIDITY));
-        }
 
-        // Transfer tokens from caller to contract before updating state
+            // Lock MINIMUM_LIQUIDITY LP tokens forever to the zero address.
+            pool.lp_total_supply.set(min_lp);
+            pool.lp_balances.setter(Address::ZERO).set(min_lp);
+
+            sqrt.checked_sub(min_lp).ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_LIQUIDITY_OVERFLOW)
+            })?
+        } else {
+            // amount0 * totalSupply / reserve0
+            let liquidity0 = amount0
+                .checked_mul(total_supply)
+                .ok_or_else(|| {
+                    unlock_reentrancy_guard(self);
+                    err(ERR_LIQUIDITY_OVERFLOW)
+                })?
+                .checked_div(reserve0)
+                .ok_or_else(|| {
+                    unlock_reentrancy_guard(self);
+                    err(ERR_DIVISION_BY_ZERO)
+                })?;
+
+            let liquidity1 = amount1
+                .checked_mul(total_supply)
+                .ok_or_else(|| {
+                    unlock_reentrancy_guard(self);
+                    err(ERR_LIQUIDITY_OVERFLOW)
+                })?
+                .checked_div(reserve1)
+                .ok_or_else(|| {
+                    unlock_reentrancy_guard(self);
+                    err(ERR_DIVISION_BY_ZERO)
+                })?;
+
+            let liq = if liquidity0 < liquidity1 {
+                liquidity0
+            } else {
+                liquidity1
+            };
+
+            if liq.is_zero() {
+                unlock_reentrancy_guard(self);
+                return Err(err(ERR_INSUFFICIENT_LIQUIDITY));
+            }
+
+            liq
+        };
+
+        // Transfer tokens from caller to contract before updating state.
         let provider = msg::sender();
         let contract_addr = contract::address();
         if let Err(e) = safe_transfer_from(token0, provider, contract_addr, amount0) {
@@ -705,8 +863,44 @@ impl OakDEX {
             return Err(e);
         }
 
-        self.reserves0.set(new_reserve0);
-        self.reserves1.set(new_reserve1);
+        // Update reserves after successful transfer (canonical order).
+        let new_reserve0 = reserve0
+            .checked_add(amount0_c)
+            .ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_RESERVE0_OVERFLOW)
+            })?;
+        let new_reserve1 = reserve1
+            .checked_add(amount1_c)
+            .ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_RESERVE1_OVERFLOW)
+            })?;
+
+        pool.reserve0.set(new_reserve0);
+        pool.reserve1.set(new_reserve1);
+
+        // Mint LP tokens to provider (pool-specific).
+        let current_total = pool.lp_total_supply.get();
+        let new_total = current_total
+            .checked_add(liquidity)
+            .ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_LIQUIDITY_OVERFLOW)
+            })?;
+        pool.lp_total_supply.set(new_total);
+
+        let current_balance = pool.lp_balances.setter(provider).get();
+        let new_balance = current_balance
+            .checked_add(liquidity)
+            .ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_LIQUIDITY_OVERFLOW)
+            })?;
+        pool.lp_balances.setter(provider).set(new_balance);
+
+        // LP token Transfer event (mint from zero).
+        emit_lp_transfer(Address::ZERO, provider, liquidity);
 
         emit_add_liquidity(provider, amount0, amount1);
 
@@ -715,6 +909,361 @@ impl OakDEX {
         unlock_reentrancy_guard(self);
 
         Ok(())
+    }
+
+    /// Remove liquidity from the pool.
+    ///
+    /// @notice Burns LP tokens and returns the underlying token0 and token1
+    ///         to the provider in proportion to their share of total supply.
+    /// @dev Uses the standard Uniswap V2 pro‑rata formula:
+    ///      amount0 = lp_amount * reserve0 / totalSupply
+    ///      amount1 = lp_amount * reserve1 / totalSupply
+    pub fn remove_liquidity(
+        &mut self,
+        token0: Address,
+        token1: Address,
+        lp_amount: U256,
+    ) -> OakResult<()> {
+        // Re-entrancy guard
+        lock_reentrancy_guard(self)?;
+
+        require_non_zero_address(token0)?;
+        require_non_zero_address(token1)?;
+
+        if lp_amount.is_zero() {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_ZERO_AMOUNT));
+        }
+
+        require_not_paused(self)?;
+
+        // Canonical pool key
+        let (pool_token0, pool_token1) = if token0 < token1 {
+            (token0, token1)
+        } else {
+            (token1, token0)
+        };
+        let outer = self.pools.setter(pool_token0);
+        let pool = outer.setter(pool_token1);
+        if !pool.initialized.get() {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INVALID_TOKEN));
+        }
+
+        let provider = msg::sender();
+        let total_supply = pool.lp_total_supply.get();
+        if total_supply.is_zero() {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INSUFFICIENT_LIQUIDITY));
+        }
+
+        // Check provider balance
+        let balance = pool.lp_balances.setter(provider).get();
+        if lp_amount > balance {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INSUFFICIENT_LIQUIDITY));
+        }
+
+        let reserve0 = pool.reserve0.get();
+        let reserve1 = pool.reserve1.get();
+
+        // Pro-rata amounts to withdraw (canonical)
+        let amount0_c = reserve0
+            .checked_mul(lp_amount)
+            .ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_OVERFLOW)
+            })?
+            .checked_div(total_supply)
+            .ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_DIVISION_BY_ZERO)
+            })?;
+        let amount1_c = reserve1
+            .checked_mul(lp_amount)
+            .ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_OVERFLOW)
+            })?
+            .checked_div(total_supply)
+            .ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_DIVISION_BY_ZERO)
+            })?;
+        if amount0_c.is_zero() || amount1_c.is_zero() {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INSUFFICIENT_LIQUIDITY));
+        }
+
+        // Map canonical amounts back to user token order
+        let (amount0, amount1) = if token0 == pool_token0 {
+            (amount0_c, amount1_c)
+        } else {
+            (amount1_c, amount0_c)
+        };
+
+        // Update LP supply and balances
+        let new_total = total_supply
+            .checked_sub(lp_amount)
+            .ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_LIQUIDITY_OVERFLOW)
+            })?;
+        pool.lp_total_supply.set(new_total);
+
+        let new_balance = balance
+            .checked_sub(lp_amount)
+            .ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_LIQUIDITY_OVERFLOW)
+            })?;
+        pool.lp_balances.setter(provider).set(new_balance);
+
+        // Update reserves after withdrawal (canonical)
+        let (new_reserve0, new_reserve1) = if token0 == pool_token0 {
+            let new_r0 = reserve0
+                .checked_sub(amount0_c)
+                .ok_or_else(|| {
+                    unlock_reentrancy_guard(self);
+                    err(ERR_INSUFFICIENT_LIQUIDITY)
+                })?;
+            let new_r1 = reserve1
+                .checked_sub(amount1_c)
+                .ok_or_else(|| {
+                    unlock_reentrancy_guard(self);
+                    err(ERR_INSUFFICIENT_LIQUIDITY)
+                })?;
+            (new_r0, new_r1)
+        } else {
+            let new_r0 = reserve0
+                .checked_sub(amount1_c)
+                .ok_or_else(|| {
+                    unlock_reentrancy_guard(self);
+                    err(ERR_INSUFFICIENT_LIQUIDITY)
+                })?;
+            let new_r1 = reserve1
+                .checked_sub(amount0_c)
+                .ok_or_else(|| {
+                    unlock_reentrancy_guard(self);
+                    err(ERR_INSUFFICIENT_LIQUIDITY)
+                })?;
+            (new_r0, new_r1)
+        };
+
+        pool.reserve0.set(new_reserve0);
+        pool.reserve1.set(new_reserve1);
+
+        // Transfer underlying tokens back to the provider
+        if let Err(e) = safe_transfer(token0, provider, amount0) {
+            unlock_reentrancy_guard(self);
+            return Err(e);
+        }
+        if let Err(e) = safe_transfer(token1, provider, amount1) {
+            unlock_reentrancy_guard(self);
+            return Err(e);
+        }
+
+        // LP token Transfer event (burn to zero).
+        emit_lp_transfer(provider, Address::ZERO, lp_amount);
+
+        // Re-entrancy guard release
+        unlock_reentrancy_guard(self);
+
+        Ok(())
+    }
+
+    /// Compute expected output amounts along a multi-hop path.
+    ///
+    /// @notice Pure view helper used by router/frontends to estimate
+    ///         final amount_out for a given path, taking per-pool fees
+    ///         into account.
+    pub fn get_amounts_out(
+        &self,
+        amount_in: U256,
+        path: Vec<Address>,
+    ) -> OakResult<Vec<U256>> {
+        if path.len() < 2 {
+            return Err(err(ERR_INVALID_PATH));
+        }
+        if amount_in.is_zero() {
+            return Err(err(ERR_INSUFFICIENT_INPUT_AMOUNT));
+        }
+
+        let mut amounts = Vec::with_capacity(path.len());
+        amounts.push(amount_in);
+        let mut current_in = amount_in;
+
+        // Single global fee setting for now.
+        let fee_bps = self.protocol_fee_bps.get();
+
+        for i in 0..(path.len() - 1) {
+            let input = path[i];
+            let output = path[i + 1];
+
+            if input == output {
+                return Err(err(ERR_INVALID_PATH));
+            }
+
+            // Canonical pair ordering.
+            let (token0, token1) = if input < output {
+                (input, output)
+            } else {
+                (output, input)
+            };
+
+            let outer = self.pools.getter(token0);
+            let pool = outer.getter(token1);
+            if !pool.initialized.get() {
+                return Err(err(ERR_INVALID_TOKEN));
+            }
+
+            let reserve0 = pool.reserve0.get();
+            let reserve1 = pool.reserve1.get();
+            if reserve0.is_zero() || reserve1.is_zero() {
+                return Err(err(ERR_INSUFFICIENT_LIQUIDITY));
+            }
+
+            // Direction within this pool.
+            let (reserve_in, reserve_out) = if input == token0 {
+                (reserve0, reserve1)
+            } else {
+                (reserve1, reserve0)
+            };
+
+            let out = get_amount_out_with_fee(current_in, reserve_in, reserve_out, fee_bps)?;
+            if out.is_zero() {
+                return Err(err(ERR_INSUFFICIENT_OUTPUT_AMOUNT));
+            }
+
+            amounts.push(out);
+            current_in = out;
+        }
+
+        Ok(amounts)
+    }
+
+    /// Get current reserves for a given token pair.
+    ///
+    /// @notice Returns reserves in the same order as the input tokens.
+    pub fn get_reserves(
+        &self,
+        token_a: Address,
+        token_b: Address,
+    ) -> OakResult<(U256, U256)> {
+        require_non_zero_address(token_a)?;
+        require_non_zero_address(token_b)?;
+        if token_a == token_b {
+            return Err(err(ERR_INVALID_TOKEN));
+        }
+
+        let (token0, token1) = if token_a < token_b {
+            (token_a, token_b)
+        } else {
+            (token_b, token_a)
+        };
+
+        let outer = self.pools.getter(token0);
+        let pool = outer.getter(token1);
+        if !pool.initialized.get() {
+            return Err(err(ERR_INVALID_TOKEN));
+        }
+
+        let reserve0 = pool.reserve0.get();
+        let reserve1 = pool.reserve1.get();
+
+        // Map back to caller's token order
+        let (out0, out1) = if token_a == token0 {
+            (reserve0, reserve1)
+        } else {
+            (reserve1, reserve0)
+        };
+
+        Ok((out0, out1))
+    }
+
+    /// Router-style multi-hop swap: exact input, minimum output.
+    ///
+    /// @notice Swaps an exact amount of the first token in `path` for as much
+    ///         as possible of the last token, going through intermediate pools.
+    /// @dev For now the recipient `to` must be the caller (`msg::sender`),
+    ///      since `process_swap` always transfers to `sender`.
+    pub fn swap_exact_tokens_for_tokens(
+        &mut self,
+        amount_in: U256,
+        amount_out_min: U256,
+        path: Vec<Address>,
+        to: Address,
+        deadline: U256,
+    ) -> OakResult<Vec<U256>> {
+        // Re-entrancy guard
+        lock_reentrancy_guard(self)?;
+
+        // Basic input validation
+        if amount_in.is_zero() {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INSUFFICIENT_INPUT_AMOUNT));
+        }
+        if amount_out_min.is_zero() {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INSUFFICIENT_OUTPUT_AMOUNT));
+        }
+        if path.len() < 2 {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INVALID_PATH));
+        }
+
+        // Recipient must be non-zero and, в текущей версии, совпадать с sender.
+        let sender = msg::sender();
+        if to == Address::ZERO || to != sender {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INVALID_ADDRESS));
+        }
+
+        require_not_paused(self)?;
+
+        // Deadline based on block timestamp
+        let now = U256::from(block::timestamp());
+        if now > deadline {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_EXPIRED));
+        }
+
+        // Compute expected amounts along the path
+        let amounts = match self.get_amounts_out(amount_in, path.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                unlock_reentrancy_guard(self);
+                return Err(e);
+            }
+        };
+
+        let final_out = *amounts.last().unwrap_or(&U256::ZERO);
+        if final_out < amount_out_min {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INSUFFICIENT_OUTPUT_AMOUNT));
+        }
+
+        // Execute the multi-hop swaps sequentially.
+        // At каждом шаге process_swap:
+        // - списывает amount_in хопа с sender в контракт
+        // - отправляет amount_out хопа обратно sender'у
+        // - обновляет резервы пула (через PoolData)
+        for i in 0..(path.len() - 1) {
+            let token_in = path[i];
+            let token_out = path[i + 1];
+            let hop_in = amounts[i];
+            let hop_min_out = amounts[i + 1]; // строгое ожидание по расчёту get_amounts_out
+
+            if let Err(e) = process_swap(self, token_in, token_out, hop_in, hop_min_out) {
+                unlock_reentrancy_guard(self);
+                return Err(e);
+            }
+        }
+
+        // Release re-entrancy guard
+        unlock_reentrancy_guard(self);
+
+        Ok(amounts)
     }
 
     /// Cancel an expired or unwanted commitment.
@@ -832,6 +1381,7 @@ impl OakDEX {
     /// - Re-entrancy guard is active during the entire flash swap
     /// - Verifies k' >= k * (1 + fee) after callback
     /// - Reverts if insufficient liquidity or repayment fails
+    #[cfg(all(not(test), target_arch = "wasm32"))]
     pub fn flash_swap(
         &mut self,
         token0: Address,
@@ -1186,6 +1736,26 @@ impl OakDEX {
         unlock_reentrancy_guard(self);
 
         Ok(())
+    }
+}
+
+/// Host/test stub for `flash_swap`.
+///
+/// Compiled for non-wasm32 targets (including `cargo test`) to keep
+/// the public interface of `OakDEX` intact without pulling in Stylus
+/// call machinery. The real implementation above is only enabled for
+/// on-chain (wasm32) builds.
+#[cfg(any(test, not(target_arch = "wasm32")))]
+impl OakDEX {
+    pub fn flash_swap(
+        &mut self,
+        _token0: Address,
+        _token1: Address,
+        _amount0_out: U256,
+        _amount1_out: U256,
+        _data: Vec<u8>,
+    ) -> OakResult<()> {
+        Err(err(ERR_PAUSED))
     }
 }
 

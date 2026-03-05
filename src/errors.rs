@@ -53,4 +53,13 @@ pub const ERR_REENTRANT_CALL: &[u8] = b"REENTRANT_CALL";
 // Treasury withdrawal errors
 pub const ERR_NO_TREASURY_FEES: &[u8] = b"NO_TREASURY_FEES";
 pub const ERR_INVALID_TOKEN: &[u8] = b"INVALID_TOKEN";
+pub const ERR_POOL_EXISTS: &[u8] = b"POOL_EXISTS";
+pub const ERR_INVALID_PATH: &[u8] = b"INVALID_PATH";
+pub const ERR_EXPIRED: &[u8] = b"EXPIRED";
+
+// Vault (GMX-style) errors
+pub const ERR_VAULT_POOL_EXCEEDED: &[u8] = b"VAULT_POOL_EXCEEDED";
+pub const ERR_VAULT_INSUFFICIENT_RESERVE: &[u8] = b"VAULT_INSUFFICIENT_RESERVE";
+pub const ERR_VAULT_RESERVE_EXCEEDS_POOL: &[u8] = b"VAULT_RESERVE_EXCEEDS_POOL";
+pub const ERR_VAULT_BUFFER: &[u8] = b"VAULT_BUFFER";
 

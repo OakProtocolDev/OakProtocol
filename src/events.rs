@@ -7,7 +7,6 @@ use alloc::vec::Vec;
 use stylus_sdk::{
     alloy_primitives::{Address, FixedBytes, U256},
     evm,
-    prelude::*,
 };
 
 /// Emit CommitSwap event.
@@ -96,6 +95,17 @@ pub fn emit_flash_swap(
     data.extend_from_slice(&amount1_out.to_be_bytes::<32>());
     data.extend_from_slice(&fee0.to_be_bytes::<32>());
     data.extend_from_slice(&fee1.to_be_bytes::<32>());
+    let _ = evm::raw_log(topics, &data);
+}
+
+/// Emit LP token Transfer-like event for LP balances.
+///
+/// @notice Mimics ERC-20 `Transfer` for LP tokens so that wallets
+///         and indexers can track LP positions.
+pub fn emit_lp_transfer(from: Address, to: Address, value: U256) {
+    let topics = &[from.into_word(), to.into_word()];
+    let mut data = Vec::new();
+    data.extend_from_slice(&value.to_be_bytes::<32>());
     let _ = evm::raw_log(topics, &data);
 }
 

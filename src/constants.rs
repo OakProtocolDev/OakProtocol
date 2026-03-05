@@ -2,7 +2,11 @@
 
 use stylus_sdk::alloy_primitives::U256;
 
-/// Default total trading fee in basis points (0.3%).
+/// Initial trading fee in basis points (0.5%) for the first month.
+pub const INITIAL_FEE: u64 = 50;
+
+/// Baseline total trading fee in basis points (0.3%).
+/// @dev Intended long‑term default after the initial launch phase.
 pub const DEFAULT_FEE_BPS: u64 = 30;
 
 /// Basis points denominator (10000 = 100%).

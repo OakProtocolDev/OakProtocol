@@ -1,4 +1,9 @@
 //! Storage layout and core data structures for Oak Protocol.
+//!
+//! This module defines the on-chain storage for both the core DEX (`OakDEX`)
+//! and the GMX-style vault/guardian (`OakSentinel`). The layout is intentionally
+//! flat and Stylus-friendly, and includes reserved space for future extensions
+//! such as the Oak Bet casino module without requiring a storage migration.
 
 use stylus_sdk::{
     alloy_primitives::{Address, U256},
@@ -22,12 +27,28 @@ pub struct Commitment {
     pub activated: bool,
 }
 
-/// Main storage structure for Oak Protocol.
-///
-/// @notice Holds all on-chain state for the DEX.
-/// @dev This layout is intentionally flat and Stylus‑friendly. Higher‑level
-///      abstractions live in `logic`.
 sol_storage! {
+    /// Per‑pair pool data for multi‑pool support.
+    pub struct PoolData {
+        /// Reserve of token0 in the pool (canonical ordering).
+        StorageU256 reserve0;
+        /// Reserve of token1 in the pool (canonical ordering).
+        StorageU256 reserve1;
+        /// Total LP token supply for this pool.
+        StorageU256 lp_total_supply;
+        /// Per‑address LP balances for this pool.
+        StorageMap<Address, StorageU256> lp_balances;
+        /// Initialization flag to distinguish configured pools.
+        StorageBool initialized;
+    }
+
+    #[cfg_attr(any(test, not(target_arch = "wasm32")), allow(unused_doc_comments))]
+    /// Main storage structure for Oak Protocol.
+    ///
+    /// @notice Holds all on-chain state for the DEX.
+    /// @dev This layout is intentionally flat and Stylus‑friendly. Higher‑level
+    ///      abstractions live in `logic`. Reserved fields at the end allow
+    ///      backwards‑compatible extension for future features (e.g. Oak Bet).
     pub struct OakDEX {
         /// Reserve of token0 in the liquidity pool.
         StorageU256 reserves0;
@@ -43,7 +64,7 @@ sol_storage! {
         /// Owner address (can change protocol settings).
         StorageAddress owner;
 
-        /// Treasury address receiving a share of fees.
+        /// Treasury address receiving a share of fees (admin wallet).
         StorageAddress treasury;
 
         /// Accrued fees owed to the treasury in token0 units.
@@ -78,9 +99,52 @@ sol_storage! {
         /// Mapping from user address to commitment activation status.
         StorageMap<Address, StorageBool> commitment_activated;
 
-        /// Global re-entrancy guard (1 = locked, 0 = unlocked).
+        /// Global re-entrancy guard (true = locked, false = unlocked).
         /// @dev Prevents recursive calls to critical functions.
         StorageBool locked;
+
+        /// Mapping from canonical token0 to inner map of token1 -> pool data.
+        /// @dev token0 and token1 are always sorted (token0 < token1) to avoid duplicates.
+        StorageMap<Address, StorageMap<Address, PoolData>> pools;
+        /// Reserved space for future protocol extensions (e.g. Oak Bet).
+        /// @dev These fields deliberately sit at the end of the layout so
+        ///      that new features can reuse them without shifting storage.
+        StorageU256 reserved2;
+        StorageU256 reserved3;
+    }
+
+    /// Guardian / vault state used by the GMX-style leverage module.
+    ///
+    /// @notice This struct backs the internal `vault` module and is intended
+    ///         to be driven by a higher-level controller (OakSentinel).
+    /// @dev Similar to `OakDEX`, we keep the layout flat and leave reserved
+    ///      slots at the end for future leverage / casino extensions.
+    pub struct OakSentinel {
+        /// Owner address for vault/admin operations.
+        StorageAddress owner;
+        /// Emergency pause for vault operations.
+        StorageBool paused;
+
+        /// Total pool amount per token (GMX: poolAmounts).
+        StorageMap<Address, StorageU256> vault_pool_amount;
+        /// Fee reserves per token (GMX: feeReserves).
+        StorageMap<Address, StorageU256> vault_fee_reserves;
+        /// Reserved token amounts backing open leverage (GMX: reservedAmounts).
+        StorageMap<Address, StorageU256> vault_reserved_amount;
+        /// Guaranteed USD exposure per collateral token (GMX: guaranteedUsd).
+        StorageMap<Address, StorageU256> vault_guaranteed_usd;
+        /// Buffer amounts per token to protect against pool underflow.
+        StorageMap<Address, StorageU256> vault_buffer_amount;
+
+        /// Global short and long exposure in USD.
+        StorageU256 vault_global_short_size_usd;
+        StorageU256 vault_global_long_size_usd;
+
+        /// Reserved space for Oak Bet / future vault features.
+        StorageU256 sentinel_reserved0;
+        StorageU256 sentinel_reserved1;
+        StorageU256 sentinel_reserved2;
+        StorageU256 sentinel_reserved3;
     }
 }
 
