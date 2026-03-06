@@ -55,8 +55,8 @@ interface TradeActions {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_BALANCES: Balances = {
-  ETH: 1.5,
-  USDC: 10000,
+  ETH: 10000,
+  USDC: 1_000_000,
   OAK: 0,
 };
 

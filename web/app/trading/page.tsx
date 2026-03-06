@@ -9,6 +9,7 @@ import { SuccessModal } from "@/components/SuccessModal";
 import { MarketList } from "@/components/Trading/MarketList";
 import { PositionTable, type PositionTableTab, type PositionRow, type OrderRow } from "@/components/Trading/PositionTable";
 import { OrderForm } from "@/components/Trading/OrderForm";
+import { TPSLOrderForm } from "@/components/Trading/TPSLOrderForm";
 import { useAccount } from "wagmi";
 import { useReadContracts } from "wagmi";
 import { useBinanceData } from "@/hooks/useBinanceData";
@@ -328,9 +329,9 @@ export default function TradingPage() {
             </div>
           </div>
 
-          {/* RIGHT: Execution Panel + Live Logs */}
+          {/* RIGHT: Execution Panel + TP/SL Orders + Live Logs */}
           <aside
-            className="flex w-[320px] shrink-0 flex-col gap-2 overflow-y-auto p-2"
+            className="flex w-[340px] shrink-0 flex-col gap-2 overflow-y-auto p-2"
             style={{ background: "#000", borderLeft: "1px solid rgba(0, 255, 0, 0.1)" }}
           >
             <OrderForm
@@ -341,6 +342,7 @@ export default function TradingPage() {
               isExecuting={isExecuting}
               onExecute={handleExecute}
             />
+            <TPSLOrderForm className="mt-1" />
             <LiveLogsPanel logs={logs} maxLines={8} variant="terminal" className="min-h-0 flex-1 overflow-hidden" />
           </aside>
         </motion.div>
