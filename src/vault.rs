@@ -253,7 +253,7 @@ pub fn _swap(
 pub fn _increase_position(
     state: &mut OakSentinel,
     collateral_token: Address,
-    index_token: Address,
+    _index_token: Address,
     size_delta_usd: U256,
     reserved_delta: U256,
     guaranteed_delta: U256,
@@ -286,7 +286,7 @@ pub fn _increase_position(
 pub fn _decrease_position(
     state: &mut OakSentinel,
     collateral_token: Address,
-    index_token: Address,
+    _index_token: Address,
     size_delta_usd: U256,
     reserved_delta: U256,
     guaranteed_delta: U256,

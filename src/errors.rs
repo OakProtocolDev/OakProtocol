@@ -63,3 +63,72 @@ pub const ERR_VAULT_INSUFFICIENT_RESERVE: &[u8] = b"VAULT_INSUFFICIENT_RESERVE";
 pub const ERR_VAULT_RESERVE_EXCEEDS_POOL: &[u8] = b"VAULT_RESERVE_EXCEEDS_POOL";
 pub const ERR_VAULT_BUFFER: &[u8] = b"VAULT_BUFFER";
 
+/// Circuit breaker triggered; swaps disabled until owner clears.
+pub const ERR_CIRCUIT_BREAKER: &[u8] = b"CIRCUIT_BREAKER";
+
+/// Path length exceeds MAX_PATH_LENGTH.
+pub const ERR_PATH_TOO_LONG: &[u8] = b"PATH_TOO_LONG";
+/// LP add liquidity: received below minimum (slippage).
+pub const ERR_LP_SLIPPAGE: &[u8] = b"LP_SLIPPAGE";
+/// Single trade size exceeds MAX_TRADE_RESERVE_BPS of reserve (bank cap).
+pub const ERR_TRADE_TOO_LARGE: &[u8] = b"TRADE_TOO_LARGE";
+/// Caller is not the pending owner.
+pub const ERR_PENDING_OWNER_ONLY: &[u8] = b"PENDING_OWNER_ONLY";
+/// No pending owner transfer.
+pub const ERR_NO_PENDING_OWNER: &[u8] = b"NO_PENDING_OWNER";
+/// Owner transfer delay not yet elapsed.
+pub const ERR_OWNER_TRANSFER_TOO_EARLY: &[u8] = b"OWNER_TRANSFER_TOO_EARLY";
+/// Treasury cannot be the contract itself (would lock funds).
+pub const ERR_TREASURY_IS_CONTRACT: &[u8] = b"TREASURY_IS_CONTRACT";
+
+// TP/SL/Limit order errors
+/// Order not found or invalid order ID.
+pub const ERR_ORDER_NOT_FOUND: &[u8] = b"ORDER_NOT_FOUND";
+/// Order is not in Open status (already executed or cancelled).
+pub const ERR_ORDER_NOT_OPEN: &[u8] = b"ORDER_NOT_OPEN";
+/// Caller is not the order owner.
+pub const ERR_ORDER_NOT_OWNER: &[u8] = b"ORDER_NOT_OWNER";
+/// Invalid order type (must be 0 Limit, 1 TP, 2 SL).
+pub const ERR_INVALID_ORDER_TYPE: &[u8] = b"INVALID_ORDER_TYPE";
+/// Price condition not met for execution.
+pub const ERR_ORDER_CONDITION_NOT_MET: &[u8] = b"ORDER_CONDITION_NOT_MET";
+
+// Position errors (pro terminal)
+/// Position not found or invalid position ID.
+pub const ERR_POSITION_NOT_FOUND: &[u8] = b"POSITION_NOT_FOUND";
+/// Caller is not the position owner.
+pub const ERR_POSITION_NOT_OWNER: &[u8] = b"POSITION_NOT_OWNER";
+/// Position is not open (already closed).
+pub const ERR_POSITION_NOT_OPEN: &[u8] = b"POSITION_NOT_OPEN";
+/// TP/SL condition not met (for execute_position_tp_sl).
+pub const ERR_POSITION_TP_SL_NOT_MET: &[u8] = b"POSITION_TP_SL_NOT_MET";
+/// Trailing stop not enabled (trailing_delta_bps == 0).
+pub const ERR_TRAILING_DISABLED: &[u8] = b"TRAILING_DISABLED";
+/// Trailing stop condition not met (price above trigger level).
+pub const ERR_TRAILING_NOT_TRIGGERED: &[u8] = b"TRAILING_NOT_TRIGGERED";
+/// Invalid OCO pair (order not found or not open).
+pub const ERR_OCO_PAIR_INVALID: &[u8] = b"OCO_PAIR_INVALID";
+/// Margin: zero amount or insufficient balance.
+pub const ERR_MARGIN_ZERO_OR_INSUFFICIENT: &[u8] = b"MARGIN_ZERO_OR_INSUFFICIENT";
+
+// Access Control
+/// Caller does not have the required role.
+pub const ERR_MISSING_ROLE: &[u8] = b"MISSING_ROLE";
+/// Cannot grant role to zero address.
+pub const ERR_GRANT_ZERO: &[u8] = b"GRANT_ZERO";
+
+// Timelock
+/// Operation not queued or id mismatch.
+pub const ERR_TIMELOCK_UNKNOWN_OPERATION: &[u8] = b"TIMELOCK_UNKNOWN_OPERATION";
+/// Delay not yet elapsed (execute before ready block).
+pub const ERR_TIMELOCK_NOT_READY: &[u8] = b"TIMELOCK_NOT_READY";
+/// Operation already executed or cancelled.
+pub const ERR_TIMELOCK_ALREADY_EXECUTED: &[u8] = b"TIMELOCK_ALREADY_EXECUTED";
+
+// Gasless / EIP-712 permit swap
+/// Invalid EIP-712 signature or recovered signer mismatch.
+pub const ERR_PERMIT_INVALID_SIGNATURE: &[u8] = b"PERMIT_INVALID_SIGNATURE";
+/// Permit swap deadline expired.
+pub const ERR_PERMIT_EXPIRED: &[u8] = b"PERMIT_EXPIRED";
+/// Permit nonce already used (replay).
+pub const ERR_PERMIT_NONCE: &[u8] = b"PERMIT_NONCE";

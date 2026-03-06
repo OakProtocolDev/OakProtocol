@@ -31,20 +31,22 @@ fn greedy_trader_fee_accounting_is_exact() {
     let mut total_input = U256::ZERO;
     let mut total_treasury_fees = U256::ZERO;
     let mut total_lp_fees = U256::ZERO;
+    let mut total_buyback_fees = U256::ZERO;
 
     for _ in 0..swaps {
         // Compute swap output under current reserves
         let amount_out =
             get_amount_out_with_fee(amount_per_swap, reserve_in, reserve_out, fee_bps).unwrap();
 
-        // Compute fee split for this swap (using the same helper as the contract)
-        let (_effective_in, treasury_fee, lp_fee) =
+        // Compute fee split for this swap (60/20/20: LP, Treasury, Buyback)
+        let (_effective_in, treasury_fee, lp_fee, buyback_fee) =
             compute_fee_split(amount_per_swap, fee_bps).unwrap();
 
         // Update cumulative accounting
         total_input = total_input + amount_per_swap;
         total_treasury_fees = total_treasury_fees + treasury_fee;
         total_lp_fees = total_lp_fees + lp_fee;
+        total_buyback_fees = total_buyback_fees + buyback_fee;
 
         // Update reserves as in the contract: reserve_in += amount_in, reserve_out -= amount_out
         reserve_in = reserve_in + amount_per_swap;
@@ -53,11 +55,11 @@ fn greedy_trader_fee_accounting_is_exact() {
 
     // Total fee should be exactly 0.5% of aggregate input (floor-div).
     let expected_total_fee = total_input * fee_bps / as_u256(FEE_DENOMINATOR);
-    let accounted_total_fee = total_treasury_fees + total_lp_fees;
+    let accounted_total_fee = total_treasury_fees + total_lp_fees + total_buyback_fees;
 
     assert_eq!(
         accounted_total_fee, expected_total_fee,
-        "Total accounted fees (treasury + LP) must equal 0.5% of total input with no rounding loss"
+        "Total accounted fees (treasury + LP + buyback) must equal 0.5% of total input with no rounding loss"
     );
 }
 
@@ -185,9 +187,9 @@ fn dust_and_limits_are_safely_handled() {
     );
 
     // Total fee for big_amount_in must be consistent with fee_bps (no overflow).
-    let (_effective_in, treasury_fee, lp_fee) =
+    let (_effective_in, treasury_fee, lp_fee, buyback_fee) =
         compute_fee_split(big_amount_in, fee_bps).expect("fee split must not overflow");
-    let total_fee = treasury_fee + lp_fee;
+    let total_fee = treasury_fee + lp_fee + buyback_fee;
     let expected_fee = big_amount_in * fee_bps / as_u256(FEE_DENOMINATOR);
     assert_eq!(
         total_fee, expected_fee,

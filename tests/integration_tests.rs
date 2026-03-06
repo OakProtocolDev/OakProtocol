@@ -220,10 +220,10 @@ fn flash_swap_fee_split_and_invariant() {
         "flash swap repayment must maintain k' >= k * (1 + fee)"
     );
 
-    // Check that fee split accounts for the same total_fee.
-    let (_effective_in, treasury_fee, lp_fee) =
+    // Check that fee split accounts for the same total_fee (60/20/20).
+    let (_effective_in, treasury_fee, lp_fee, buyback_fee) =
         compute_fee_split(amount0_out, fee_bps).expect("fee split must succeed");
-    let accounted_total_fee = treasury_fee + lp_fee;
+    let accounted_total_fee = treasury_fee + lp_fee + buyback_fee;
     assert_eq!(
         accounted_total_fee, total_fee,
         "fee split should match total flash swap fee"

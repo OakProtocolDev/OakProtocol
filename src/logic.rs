@@ -5,22 +5,31 @@ use alloc::vec::Vec;
 use stylus_sdk::{
     alloy_primitives::{Address, FixedBytes, U256},
     block,
+    call::{self, Call},
     contract,
     crypto,
     msg,
+    prelude::public,
 };
 
 use crate::{
+    access::{default_admin_role, pauser_role},
     constants::{
-        as_u256, q112_u256, COMMIT_REVEAL_DELAY, DEFAULT_FEE_BPS, FEE_DENOMINATOR, GAS_REBATE_BPS,
-        INITIAL_FEE, MAX_COMMITMENT_AGE, MAX_FEE_BPS, MINIMUM_LIQUIDITY, TREASURY_FEE_BPS,
+        as_u256, q112_u256, BPS, CIRCUIT_BREAKER_IMPACT_BPS, COMMIT_REVEAL_DELAY, DEFAULT_FEE_BPS,
+        FEE_DENOMINATOR, GAS_REBATE_BPS, INITIAL_FEE, LP_FEE_PCT, MAX_COMMITMENT_AGE, MAX_FEE_BPS,
+        MAX_PATH_LENGTH, MAX_TRADE_RESERVE_BPS, MINIMUM_LIQUIDITY, OWNER_TRANSFER_DELAY_BLOCKS,
+        TREASURY_FEE_BPS, BUYBACK_FEE_PCT, TREASURY_FEE_PCT,
     },
     errors::*,
     events::{
-        emit_add_liquidity, emit_cancel_commitment, emit_commit_swap, emit_flash_swap,
-        emit_lp_transfer, emit_pause_changed, emit_reveal_swap, emit_set_fee,
-        emit_withdraw_treasury_fees,
+        emit_add_liquidity, emit_buyback_wallet_set, emit_cancel_commitment, emit_circuit_breaker_cleared,
+        emit_circuit_breaker_triggered, emit_close_position, emit_commit_swap, emit_flash_swap,
+        emit_lp_transfer,         emit_open_position, emit_order_cancelled, emit_order_executed,
+        emit_order_placed, emit_owner_changed, emit_pause_changed, emit_pending_owner_set,
+        emit_pool_created, emit_reveal_swap, emit_set_fee, emit_set_position_tp_sl,
+        emit_set_position_trailing, emit_trailing_stop_triggered, emit_withdraw_treasury_fees,
     },
+    pausable::Pausable,
     state::OakDEX,
     token::{balance_of, safe_transfer, safe_transfer_from},
 };
@@ -34,7 +43,8 @@ fn encode_commit_data(amount_in: U256, salt: U256) -> Vec<u8> {
 }
 
 /// Compute commitment hash as `keccak256(abi.encode(amount_in, salt))`.
-fn compute_commit_hash(amount_in: U256, salt: U256) -> FixedBytes<32> {
+/// Public for test and SDK use.
+pub fn compute_commit_hash(amount_in: U256, salt: U256) -> FixedBytes<32> {
     let encoded = encode_commit_data(amount_in, salt);
     crypto::keccak(&encoded)
 }
@@ -86,6 +96,27 @@ fn unlock_reentrancy_guard(dex: &mut OakDEX) {
 fn require_not_paused(dex: &OakDEX) -> OakResult<()> {
     if dex.paused.get() {
         return Err(err(ERR_PAUSED));
+    }
+    Ok(())
+}
+
+/// Map order ID (U256) to storage key (Address = last 20 bytes of BE encoding).
+fn order_id_to_address(order_id: U256) -> Address {
+    let b = order_id.to_be_bytes::<32>();
+    Address::from_slice(&b[12..32])
+}
+
+/// Map position ID (U256) to storage key (same as order_id for consistency).
+fn position_id_to_address(position_id: U256) -> Address {
+    let b = position_id.to_be_bytes::<32>();
+    Address::from_slice(&b[12..32])
+}
+
+/// Safety circuit breaker: when triggered, swaps and add_liquidity are disabled.
+/// Only remove_liquidity and claim_fees allowed. Owner can clear.
+fn require_not_circuit_breaker(dex: &OakDEX) -> OakResult<()> {
+    if dex.circuit_breaker_triggered.get() {
+        return Err(err(ERR_CIRCUIT_BREAKER));
     }
     Ok(())
 }
@@ -144,39 +175,36 @@ fn update_oracle(dex: &mut OakDEX, reserve0: U256, reserve1: U256) -> OakResult<
     Ok(())
 }
 
-/// Core swap processing: invariant math, slippage protection, fee accounting and transfers.
+/// Core swap processing with configurable from/to (for direct swaps and order execution).
 ///
-/// @notice Internal helper used by entrypoints that perform a swap.
-/// @dev Applies strict slippage checks, uses fully checked arithmetic, and
-///      accrues protocol fees to the admin (treasury) accounting bucket.
-fn process_swap(
+/// @notice When `from` == contract, no transfer_in is performed (tokens already in contract).
+/// @dev Used by process_swap (from=to=msg::sender) and execute_order (from=contract, to=order_owner).
+fn process_swap_from_to(
     dex: &mut OakDEX,
+    from: Address,
+    to: Address,
     token0: Address,
     token1: Address,
     amount_in: U256,
     min_amount_out: U256,
 ) -> OakResult<U256> {
-    // Input sanitization: validate addresses
     require_non_zero_address(token0)?;
     require_non_zero_address(token1)?;
-
-    // Input sanitization: validate amounts
     if amount_in.is_zero() {
         return Err(err(ERR_INSUFFICIENT_INPUT_AMOUNT));
     }
     if min_amount_out.is_zero() {
         return Err(err(ERR_INSUFFICIENT_OUTPUT_AMOUNT));
     }
-
-    // Emergency circuit breaker
     require_not_paused(dex)?;
+    require_not_circuit_breaker(dex)?;
 
-    let sender = msg::sender();
-
-    // Balance check: ensure user has enough tokens before attempting transfer.
-    let user_balance = balance_of(token0, sender);
-    if user_balance < amount_in {
-        return Err(err(ERR_INSUFFICIENT_BALANCE));
+    let contract_addr = contract::address();
+    if from != contract_addr {
+        let user_balance = balance_of(token0, from);
+        if user_balance < amount_in {
+            return Err(err(ERR_INSUFFICIENT_BALANCE));
+        }
     }
 
     // Snapshot pool reserves and fee configuration.
@@ -206,19 +234,58 @@ fn process_swap(
         (reserve1, reserve0)
     };
 
+    // Bank-style cap: single trade cannot exceed MAX_TRADE_RESERVE_BPS of reserve (e.g. 10%).
+    let max_trade = reserve_in
+        .checked_mul(as_u256(MAX_TRADE_RESERVE_BPS))
+        .ok_or_else(|| err(ERR_OVERFLOW))?
+        .checked_div(as_u256(BPS))
+        .ok_or_else(|| err(ERR_DIVISION_BY_ZERO))?;
+    if amount_in > max_trade {
+        return Err(err(ERR_TRADE_TOO_LARGE));
+    }
+
     let amount_out = get_amount_out_with_fee(amount_in, reserve_in, reserve_out, fee_bps)?;
+
+    // Circuit breaker: auto-trigger on extreme price impact (e.g. 20%+). Audit trail event.
+    let impact_num = amount_out
+        .checked_mul(reserve_in)
+        .ok_or_else(|| err(ERR_OVERFLOW))?
+        .checked_mul(as_u256(BPS))
+        .ok_or_else(|| err(ERR_OVERFLOW))?;
+    let impact_den = amount_in
+        .checked_mul(reserve_out)
+        .ok_or_else(|| err(ERR_OVERFLOW))?;
+    let impact_bps = if impact_den.is_zero() {
+        U256::ZERO
+    } else {
+        impact_num.checked_div(impact_den).unwrap_or(U256::ZERO)
+    };
+    let price_impact_bps = as_u256(BPS).saturating_sub(impact_bps).min(U256::from(10000u64));
+    if price_impact_bps >= as_u256(CIRCUIT_BREAKER_IMPACT_BPS) {
+        dex.circuit_breaker_triggered.set(true);
+        emit_circuit_breaker_triggered(price_impact_bps);
+        return Err(err(ERR_CIRCUIT_BREAKER));
+    }
 
     // Strict slippage protection: revert if actual output below minimum.
     if amount_out < min_amount_out {
         return Err(err(ERR_SLIPPAGE_EXCEEDED));
     }
 
-    // Compute fee split for analytics and treasury accounting.
-    let (_effective_in, treasury_fee, lp_fee) = compute_fee_split(amount_in, fee_bps)?;
+    // Compute fee split: 60% LP, 20% Treasury, 20% Buyback.
+    let (_effective_in, treasury_fee, lp_fee, buyback_fee) =
+        compute_fee_split(amount_in, fee_bps)?;
 
-    // Update reserves under the standard CPMM assumption.
+    // Reserve invariant: only (amount_in - treasury - buyback) goes to pool; rest is claimable by owner.
+    // This ensures withdraw_treasury_fees does not drain pool reserves (balance = pool_reserves + treasury + buyback).
+    let to_pool_in = amount_in
+        .checked_sub(treasury_fee)
+        .ok_or_else(|| err(ERR_OVERFLOW))?
+        .checked_sub(buyback_fee)
+        .ok_or_else(|| err(ERR_OVERFLOW))?;
+
     let new_reserve_in = reserve_in
-        .checked_add(amount_in)
+        .checked_add(to_pool_in)
         .ok_or_else(|| err(ERR_RESERVE0_OVERFLOW))?;
 
     let new_reserve_out = reserve_out
@@ -259,18 +326,20 @@ fn process_swap(
     dex.total_volume_token0.set(new_volume0);
     dex.total_volume_token1.set(new_volume1);
 
-    let current_treasury_fees = dex.accrued_treasury_fees_token0.get();
-    let current_lp_fees = dex.accrued_lp_fees_token0.get();
-
-    let new_treasury_fees = current_treasury_fees
-        .checked_add(treasury_fee)
-        .ok_or_else(|| err(ERR_OVERFLOW))?;
-    let new_lp_fees = current_lp_fees
-        .checked_add(lp_fee)
-        .ok_or_else(|| err(ERR_OVERFLOW))?;
-
-    dex.accrued_treasury_fees_token0.set(new_treasury_fees);
-    dex.accrued_lp_fees_token0.set(new_lp_fees);
+    // Per-token treasury and buyback (60/20/20 model).
+    let token_in = token0;
+    let prev_treasury = dex.treasury_balance.setter(token_in).get();
+    let prev_buyback = dex.buyback_balance.setter(token_in).get();
+    dex.treasury_balance.setter(token_in).set(
+        prev_treasury
+            .checked_add(treasury_fee)
+            .ok_or_else(|| err(ERR_OVERFLOW))?,
+    );
+    dex.buyback_balance.setter(token_in).set(
+        prev_buyback
+            .checked_add(buyback_fee)
+            .ok_or_else(|| err(ERR_OVERFLOW))?,
+    );
 
     // Gas-rebate placeholder: track a small portion of protocol fee for future gas rebates.
     let total_fee = treasury_fee
@@ -289,19 +358,124 @@ fn process_swap(
         dex.accrued_gas_rebate_token0.set(new_acc);
     }
 
-    // Transfer tokens: user -> contract (token0)
-    let contract_addr = contract::address();
-    safe_transfer_from(token0, sender, contract_addr, amount_in)?;
-
-    // Transfer tokens: contract -> user (token1)
-    safe_transfer(token1, sender, amount_out)?;
-
-    // Emit swap event with fee split; admin wallet (treasury) can later withdraw
-    // its share via `withdraw_treasury_fees`, which transfers directly to the
-    // configured treasury address.
-    emit_reveal_swap(sender, amount_in, amount_out, treasury_fee, lp_fee);
+    // Transfer in: from -> contract (skip if from == contract, tokens already there)
+    if from != contract_addr {
+        safe_transfer_from(token0, from, contract_addr, amount_in)?;
+    }
+    // Transfer out: contract -> to
+    safe_transfer(token1, to, amount_out)?;
 
     Ok(amount_out)
+}
+
+/// Core swap processing: invariant math, slippage protection, fee accounting and transfers.
+///
+/// @notice Entrypoint path: from = to = msg::sender. Emits RevealSwap.
+fn process_swap(
+    dex: &mut OakDEX,
+    token0: Address,
+    token1: Address,
+    amount_in: U256,
+    min_amount_out: U256,
+) -> OakResult<U256> {
+    let sender = msg::sender();
+    let amount_out = process_swap_from_to(dex, sender, sender, token0, token1, amount_in, min_amount_out)?;
+    let (_effective_in, treasury_fee, lp_fee, _buyback_fee) =
+        compute_fee_split(amount_in, dex.protocol_fee_bps.get())?;
+    emit_reveal_swap(sender, amount_in, amount_out, treasury_fee, lp_fee);
+    Ok(amount_out)
+}
+
+// ---------- EIP-712 Gasless Permit Swap ----------
+
+/// EIP-712 domain name and version for PermitSwap.
+const EIP712_NAME: &[u8] = b"Oak Protocol";
+const EIP712_VERSION: &[u8] = b"1";
+/// Chain ID for EIP-712 domain (Arbitrum One). Use same chain as deployment.
+const CHAIN_ID_ARBITRUM_ONE: u64 = 42161;
+
+fn ecrecover_precompile() -> Address {
+    Address::from_word(U256::from(1u64).to_be_bytes::<32>().into())
+}
+
+/// keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
+fn eip712_domain_type_hash() -> FixedBytes<32> {
+    crypto::keccak(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
+}
+
+/// keccak256("PermitSwap(address owner,address tokenIn,address tokenOut,uint256 amountIn,uint256 minAmountOut,uint256 deadline,uint256 nonce)")
+fn permit_swap_type_hash() -> FixedBytes<32> {
+    crypto::keccak(b"PermitSwap(address owner,address tokenIn,address tokenOut,uint256 amountIn,uint256 minAmountOut,uint256 deadline,uint256 nonce)")
+}
+
+/// Encode 32-byte value for ABI (left-pad to 32 bytes).
+fn enc_u256(x: U256) -> [u8; 32] {
+    x.to_be_bytes::<32>()
+}
+fn enc_addr(a: Address) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[12..32].copy_from_slice(a.as_slice());
+    out
+}
+
+/// Compute EIP-712 domain separator: hash of encoded domain.
+fn compute_domain_separator(verifying_contract: Address, chain_id: u64) -> FixedBytes<32> {
+    let name_hash = crypto::keccak(EIP712_NAME);
+    let version_hash = crypto::keccak(EIP712_VERSION);
+    let mut enc = Vec::with_capacity(128);
+    enc.extend_from_slice(eip712_domain_type_hash().as_slice());
+    enc.extend_from_slice(name_hash.as_slice());
+    enc.extend_from_slice(version_hash.as_slice());
+    enc.extend_from_slice(&enc_u256(U256::from(chain_id)));
+    enc.extend_from_slice(&enc_addr(verifying_contract));
+    crypto::keccak(&enc)
+}
+
+/// Compute EIP-712 digest for PermitSwap: "\x19\x01" || domainSeparator || structHash.
+fn compute_permit_swap_digest(
+    owner: Address,
+    token_in: Address,
+    token_out: Address,
+    amount_in: U256,
+    min_amount_out: U256,
+    deadline: U256,
+    nonce: U256,
+    domain_separator: &FixedBytes<32>,
+) -> FixedBytes<32> {
+    let type_hash = permit_swap_type_hash();
+    let mut enc = Vec::with_capacity(256);
+    enc.extend_from_slice(type_hash.as_slice());
+    enc.extend_from_slice(&enc_addr(owner));
+    enc.extend_from_slice(&enc_addr(token_in));
+    enc.extend_from_slice(&enc_addr(token_out));
+    enc.extend_from_slice(&enc_u256(amount_in));
+    enc.extend_from_slice(&enc_u256(min_amount_out));
+    enc.extend_from_slice(&enc_u256(deadline));
+    enc.extend_from_slice(&enc_u256(nonce));
+    let struct_hash = crypto::keccak(&enc);
+    let mut prefix = Vec::with_capacity(66);
+    prefix.extend_from_slice(b"\x19\x01");
+    prefix.extend_from_slice(domain_separator.as_slice());
+    prefix.extend_from_slice(struct_hash.as_slice());
+    crypto::keccak(&prefix)
+}
+
+/// Recover signer from EIP-712 digest and (v, r, s). Returns zero address on failure.
+fn ecrecover_recover(digest: FixedBytes<32>, v: u8, r: [u8; 32], s: [u8; 32]) -> Address {
+    let v_normalized = if v <= 1 { v + 27 } else { v };
+    let mut calldata = Vec::with_capacity(128);
+    calldata.extend_from_slice(digest.as_slice());
+    calldata.extend_from_slice(&enc_u256(U256::from(v_normalized)));
+    calldata.extend_from_slice(&r);
+    calldata.extend_from_slice(&s);
+    let precompile = ecrecover_precompile();
+    match call::static_call(Call::new(), precompile, &calldata) {
+        Ok(ret) if ret.len() >= 32 => {
+            let out: [u8; 32] = ret[0..32].try_into().unwrap_or([0; 32]);
+            Address::from_slice(&out[12..32])
+        }
+        _ => Address::ZERO,
+    }
 }
 
 /// Pure CPMM math with a configurable total fee.
@@ -364,15 +538,48 @@ pub fn get_amount_out_with_fee(
     Ok(amount_out)
 }
 
-/// Compute the total fee and its split between treasury and LPs.
+/// Inverse of get_amount_out: amount_in needed to receive at least amount_out (single hop). Rounds up (protocol-safe).
+pub fn get_amount_in_with_fee(
+    amount_out: U256,
+    reserve_in: U256,
+    reserve_out: U256,
+    fee_bps: U256,
+) -> OakResult<U256> {
+    if amount_out.is_zero() || reserve_in.is_zero() || reserve_out.is_zero() {
+        return Err(err(ERR_INSUFFICIENT_INPUT_AMOUNT));
+    }
+    let reserve_out_sub = reserve_out.checked_sub(amount_out).ok_or_else(|| err(ERR_INSUFFICIENT_LIQUIDITY))?;
+    let fee_mult = as_u256(FEE_DENOMINATOR).checked_sub(fee_bps).ok_or_else(|| err(ERR_FEE_OVERFLOW))?;
+    let numerator = amount_out
+        .checked_mul(reserve_in)
+        .ok_or_else(|| err(ERR_OVERFLOW))?
+        .checked_mul(as_u256(FEE_DENOMINATOR))
+        .ok_or_else(|| err(ERR_OVERFLOW))?;
+    let denominator = reserve_out_sub
+        .checked_mul(fee_mult)
+        .ok_or_else(|| err(ERR_OVERFLOW))?;
+    let amount_in = numerator
+        .checked_div(denominator)
+        .ok_or_else(|| err(ERR_DIVISION_BY_ZERO))?;
+    let remainder = numerator % denominator;
+    let amount_in_ceil = if remainder.is_zero() {
+        amount_in
+    } else {
+        amount_in.checked_add(U256::from(1u64)).ok_or_else(|| err(ERR_OVERFLOW))?
+    };
+    Ok(amount_in_ceil)
+}
+
+/// Compute the total fee and its split: 60% LP, 20% Treasury, 20% Buyback.
 ///
-/// @notice Splits a 0.3% fee into 0.12% treasury and 0.18% LPs.
-/// @dev All math is done in `U256` to avoid narrowing conversions.
-///      Rounding favors the protocol: any rounding remainder is allocated to LPs
-///      to ensure treasury_fee + lp_fee = total_fee exactly.
-pub fn compute_fee_split(amount_in: U256, fee_bps: U256) -> OakResult<(U256, U256, U256)> {
+/// @notice World-class fee model: LPs get majority, treasury and buyback fund get equal shares.
+/// @dev All math checked; remainder goes to LP to avoid dust.
+pub fn compute_fee_split(
+    amount_in: U256,
+    fee_bps: U256,
+) -> OakResult<(U256, U256, U256, U256)> {
     if amount_in.is_zero() {
-        return Ok((U256::ZERO, U256::ZERO, U256::ZERO));
+        return Ok((U256::ZERO, U256::ZERO, U256::ZERO, U256::ZERO));
     }
 
     let total_fee = amount_in
@@ -382,32 +589,35 @@ pub fn compute_fee_split(amount_in: U256, fee_bps: U256) -> OakResult<(U256, U25
         .ok_or_else(|| err(ERR_DIVISION_BY_ZERO))?;
 
     if total_fee.is_zero() {
-        return Ok((amount_in, U256::ZERO, U256::ZERO));
+        return Ok((amount_in, U256::ZERO, U256::ZERO, U256::ZERO));
     }
 
-    // Calculate treasury fee (0.12% = 12/30 of total fee)
+    // 20% Treasury
     let treasury_fee = total_fee
-        .checked_mul(as_u256(TREASURY_FEE_BPS))
+        .checked_mul(as_u256(TREASURY_FEE_PCT))
         .ok_or_else(|| err(ERR_OVERFLOW))?
-        .checked_div(as_u256(DEFAULT_FEE_BPS))
+        .checked_div(U256::from(100u64))
         .ok_or_else(|| err(ERR_DIVISION_BY_ZERO))?;
 
-    // Calculate LP fee (0.18% = 18/30 of total fee)
-    // Rounding protection: ensure treasury_fee + lp_fee = total_fee exactly
-    // Any rounding remainder goes to LPs (protocol-favorable)
+    // 20% Buyback
+    let buyback_fee = total_fee
+        .checked_mul(as_u256(BUYBACK_FEE_PCT))
+        .ok_or_else(|| err(ERR_OVERFLOW))?
+        .checked_div(U256::from(100u64))
+        .ok_or_else(|| err(ERR_DIVISION_BY_ZERO))?;
+
+    // 60% LP (remainder to avoid rounding dust)
     let lp_fee = total_fee
         .checked_sub(treasury_fee)
+        .ok_or_else(|| err(ERR_OVERFLOW))?
+        .checked_sub(buyback_fee)
         .ok_or_else(|| err(ERR_OVERFLOW))?;
-
-    // Verify: treasury_fee + lp_fee = total_fee (no precision loss)
-    // This ensures the protocol never loses 1 wei due to rounding
-    debug_assert!(treasury_fee + lp_fee == total_fee);
 
     let effective_in = amount_in
         .checked_sub(total_fee)
         .ok_or_else(|| err(ERR_OVERFLOW))?;
 
-    Ok((effective_in, treasury_fee, lp_fee))
+    Ok((effective_in, treasury_fee, lp_fee, buyback_fee))
 }
 
 /// Integer square root for `U256` (floor).
@@ -457,11 +667,10 @@ impl OakDEX {
 
         // Canonical ordering
         let (token0, token1) = if token_a < token_b {
-            token_a
+            (token_a, token_b)
         } else {
-            token_b
+            (token_b, token_a)
         };
-        let token1 = if token_a < token_b { token_b } else { token_a };
 
         // Access pool storage
         let mut outer = self.pools.setter(token0);
@@ -478,7 +687,8 @@ impl OakDEX {
         pool.lp_total_supply.set(U256::ZERO);
         pool.initialized.set(true);
 
-        // Release guard
+        emit_pool_created(token0, token1);
+
         unlock_reentrancy_guard(self);
 
         Ok(())
@@ -498,6 +708,10 @@ impl OakDEX {
         }
         if treasury == Address::ZERO {
             return Err(err(ERR_INVALID_OWNER));
+        }
+        let contract_addr = contract::address();
+        if treasury == contract_addr {
+            return Err(err(ERR_TREASURY_IS_CONTRACT));
         }
 
         self.owner.set(initial_owner);
@@ -519,9 +733,18 @@ impl OakDEX {
         self.block_timestamp_last.set(U256::ZERO);
         self.accrued_gas_rebate_token0.set(U256::ZERO);
 
-        // Contract starts active and unlocked.
+        // Contract starts active, unlocked, circuit breaker off.
         self.paused.set(false);
         self.locked.set(false);
+        self.circuit_breaker_triggered.set(false);
+        self.buyback_wallet.set(Address::ZERO);
+        self.pending_owner.set(Address::ZERO);
+        self.owner_transfer_after_block.set(U256::ZERO);
+        self.next_position_id.set(U256::ZERO);
+
+        // Access Control: grant DEFAULT_ADMIN_ROLE and PAUSER_ROLE to initial_owner (multisig).
+        self.roles.setter(default_admin_role()).setter(initial_owner).set(true);
+        self.roles.setter(pauser_role()).setter(initial_owner).set(true);
 
         Ok(())
     }
@@ -547,29 +770,17 @@ impl OakDEX {
 
     /// Pause trading in case of emergency.
     ///
-    /// @notice Owner‑only panic button that disables swaps and commits.
-    /// @dev This is a standard safety switch for governance and responders.
+    /// @notice Caller must have PAUSER_ROLE (e.g. multisig). Disables swaps and commits.
+    /// @dev Uses Pausable trait; CEI: state update before any external.
     pub fn pause(&mut self) -> OakResult<()> {
-        let owner = self.owner.get();
-        only_owner(owner)?;
-
-        self.paused.set(true);
-        emit_pause_changed(true);
-
-        Ok(())
+        Pausable::pause(self).map_err(|e| e)
     }
 
     /// Resume trading after an incident is resolved.
     ///
-    /// @notice Owner‑only function to re‑enable all functionality.
+    /// @notice Caller must have PAUSER_ROLE.
     pub fn unpause(&mut self) -> OakResult<()> {
-        let owner = self.owner.get();
-        only_owner(owner)?;
-
-        self.paused.set(false);
-        emit_pause_changed(false);
-
-        Ok(())
+        Pausable::unpause(self).map_err(|e| e)
     }
 
     /// Create a swap commitment.
@@ -638,8 +849,8 @@ impl OakDEX {
             return Err(err(ERR_INSUFFICIENT_OUTPUT_AMOUNT));
         }
 
-        // Emergency circuit breaker
         require_not_paused(self)?;
+        require_not_circuit_breaker(self)?;
 
         // Deadline protection: revert if transaction is included after deadline (block number).
         let current_block = U256::from(block::number());
@@ -722,6 +933,95 @@ impl OakDEX {
         Ok(())
     }
 
+    /// Execute a swap on behalf of `owner` using EIP-712 permit (gasless flow).
+    ///
+    /// @notice Relayer calls this paying gas; contract verifies ECDSA signature then runs swap.
+    /// @dev Checks deadline (block number), nonce, recovers signer; increments nonce; executes process_swap_from_to(owner, owner, ...).
+    pub fn execute_swap_with_permit(
+        &mut self,
+        owner: Address,
+        token_in: Address,
+        token_out: Address,
+        amount_in: U256,
+        min_amount_out: U256,
+        deadline: U256,
+        nonce: U256,
+        v: u8,
+        r: FixedBytes<32>,
+        s: FixedBytes<32>,
+    ) -> OakResult<()> {
+        lock_reentrancy_guard(self)?;
+
+        require_non_zero_address(owner)?;
+        require_non_zero_address(token_in)?;
+        require_non_zero_address(token_out)?;
+        if amount_in.is_zero() {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INSUFFICIENT_INPUT_AMOUNT));
+        }
+        if min_amount_out.is_zero() {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INSUFFICIENT_OUTPUT_AMOUNT));
+        }
+
+        require_not_paused(self)?;
+        require_not_circuit_breaker(self)?;
+
+        let current_block = U256::from(block::number());
+        if current_block > deadline {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_PERMIT_EXPIRED));
+        }
+
+        let current_nonce = self.permit_swap_nonce.setter(owner).get();
+        if nonce != current_nonce {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_PERMIT_NONCE));
+        }
+        self.permit_swap_nonce.setter(owner).set(
+            current_nonce.checked_add(U256::from(1u64)).ok_or_else(|| err(ERR_OVERFLOW))?,
+        );
+
+        let contract_addr = contract::address();
+        let domain_separator = compute_domain_separator(contract_addr, CHAIN_ID_ARBITRUM_ONE);
+        let digest = compute_permit_swap_digest(
+            owner,
+            token_in,
+            token_out,
+            amount_in,
+            min_amount_out,
+            deadline,
+            nonce,
+            &domain_separator,
+        );
+        let recovered = ecrecover_recover(digest, v, r.0, s.0);
+        if recovered != owner {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_PERMIT_INVALID_SIGNATURE));
+        }
+
+        let amount_out = process_swap_from_to(
+            self,
+            owner,
+            owner,
+            token_in,
+            token_out,
+            amount_in,
+            min_amount_out,
+        )?;
+        let (_effective_in, treasury_fee, lp_fee, _buyback_fee) =
+            compute_fee_split(amount_in, self.protocol_fee_bps.get())?;
+        emit_reveal_swap(owner, amount_in, amount_out, treasury_fee, lp_fee);
+
+        unlock_reentrancy_guard(self);
+        Ok(())
+    }
+
+    /// Returns the current permit-swap nonce for `owner` (for EIP-712 gasless flow).
+    pub fn get_permit_swap_nonce(&mut self, owner: Address) -> U256 {
+        self.permit_swap_nonce.setter(owner).get()
+    }
+
     /// Add liquidity to the pool.
     ///
     /// @notice Adds token0 and token1 to the reserves, enforcing minimum liquidity.
@@ -734,12 +1034,16 @@ impl OakDEX {
     /// * `token1` - Address of token1
     /// * `amount0` - Amount of token0 to add
     /// * `amount1` - Amount of token1 to add
+    /// * `amount0_min` - Minimum amount0 to accept (LP slippage protection)
+    /// * `amount1_min` - Minimum amount1 to accept (LP slippage protection)
     pub fn add_liquidity(
         &mut self,
         token0: Address,
         token1: Address,
         amount0: U256,
         amount1: U256,
+        amount0_min: U256,
+        amount1_min: U256,
     ) -> OakResult<()> {
         // CRITICAL: Re-entrancy guard acquired at the VERY BEGINNING
         // This must be the first state-modifying operation
@@ -760,6 +1064,7 @@ impl OakDEX {
         }
 
         require_not_paused(self)?;
+        require_not_circuit_breaker(self)?;
 
         // Canonicalize token ordering for pool key.
         let (pool_token0, pool_token1) = if token0 < token1 {
@@ -767,8 +1072,8 @@ impl OakDEX {
         } else {
             (token1, token0)
         };
-        let outer = self.pools.setter(pool_token0);
-        let pool = outer.setter(pool_token1);
+        let mut outer = self.pools.setter(pool_token0);
+        let mut pool = outer.setter(pool_token1);
         if !pool.initialized.get() {
             unlock_reentrancy_guard(self);
             return Err(err(ERR_INVALID_TOKEN));
@@ -780,6 +1085,12 @@ impl OakDEX {
         } else {
             (amount1, amount0)
         };
+
+        // LP slippage protection (bank-grade: never accept below user minimum).
+        if amount0_c < amount0_min || amount1_c < amount1_min {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_LP_SLIPPAGE));
+        }
 
         let reserve0 = pool.reserve0.get();
         let reserve1 = pool.reserve1.get();
@@ -923,6 +1234,8 @@ impl OakDEX {
         token0: Address,
         token1: Address,
         lp_amount: U256,
+        amount0_min: U256,
+        amount1_min: U256,
     ) -> OakResult<()> {
         // Re-entrancy guard
         lock_reentrancy_guard(self)?;
@@ -943,8 +1256,8 @@ impl OakDEX {
         } else {
             (token1, token0)
         };
-        let outer = self.pools.setter(pool_token0);
-        let pool = outer.setter(pool_token1);
+        let mut outer = self.pools.setter(pool_token0);
+        let mut pool = outer.setter(pool_token1);
         if !pool.initialized.get() {
             unlock_reentrancy_guard(self);
             return Err(err(ERR_INVALID_TOKEN));
@@ -958,7 +1271,7 @@ impl OakDEX {
         }
 
         // Check provider balance
-        let balance = pool.lp_balances.setter(provider).get();
+        let balance = pool.lp_balances.getter(provider).get();
         if lp_amount > balance {
             unlock_reentrancy_guard(self);
             return Err(err(ERR_INSUFFICIENT_LIQUIDITY));
@@ -993,6 +1306,10 @@ impl OakDEX {
         if amount0_c.is_zero() || amount1_c.is_zero() {
             unlock_reentrancy_guard(self);
             return Err(err(ERR_INSUFFICIENT_LIQUIDITY));
+        }
+        if amount0_c < amount0_min || amount1_c < amount1_min {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_LP_SLIPPAGE));
         }
 
         // Map canonical amounts back to user token order
@@ -1084,6 +1401,9 @@ impl OakDEX {
     ) -> OakResult<Vec<U256>> {
         if path.len() < 2 {
             return Err(err(ERR_INVALID_PATH));
+        }
+        if path.len() as u64 > MAX_PATH_LENGTH {
+            return Err(err(ERR_PATH_TOO_LONG));
         }
         if amount_in.is_zero() {
             return Err(err(ERR_INSUFFICIENT_INPUT_AMOUNT));
@@ -1211,6 +1531,10 @@ impl OakDEX {
             unlock_reentrancy_guard(self);
             return Err(err(ERR_INVALID_PATH));
         }
+        if path.len() as u64 > MAX_PATH_LENGTH {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_PATH_TOO_LONG));
+        }
 
         // Recipient must be non-zero and, в текущей версии, совпадать с sender.
         let sender = msg::sender();
@@ -1220,6 +1544,7 @@ impl OakDEX {
         }
 
         require_not_paused(self)?;
+        require_not_circuit_breaker(self)?;
 
         // Deadline based on block timestamp
         let now = U256::from(block::timestamp());
@@ -1264,6 +1589,718 @@ impl OakDEX {
         unlock_reentrancy_guard(self);
 
         Ok(amounts)
+    }
+
+    // ---------- TP/SL/Limit orders (pro exchange features) ----------
+
+    /// Place a TP, SL or Limit order. Tokens to sell are escrowed in the contract.
+    ///
+    /// @param token_in Token to receive when order executes.
+    /// @param token_out Token to sell (transferred from caller to contract).
+    /// @param amount_out Amount of token_out to sell.
+    /// @param trigger_price For TP/Limit: execute when price >= this; for SL: when price <= this (price = reserve_in/reserve_out).
+    /// @param order_type 0 = Limit, 1 = TP, 2 = SL.
+    /// @param oco_with_order_id If non-zero, link this order with another (OCO). When either executes, the other is cancelled.
+    pub fn place_order(
+        &mut self,
+        token_in: Address,
+        token_out: Address,
+        amount_out: U256,
+        trigger_price: U256,
+        order_type: U256,
+        oco_with_order_id: U256,
+    ) -> OakResult<U256> {
+        lock_reentrancy_guard(self)?;
+        require_non_zero_address(token_in)?;
+        require_non_zero_address(token_out)?;
+        if token_in == token_out {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INVALID_TOKEN));
+        }
+        if amount_out.is_zero() {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INSUFFICIENT_INPUT_AMOUNT));
+        }
+        let order_type_u = order_type.as_limbs()[0];
+        if order_type_u > 2 {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INVALID_ORDER_TYPE));
+        }
+        require_not_paused(self)?;
+        require_not_circuit_breaker(self)?;
+
+        let sender = msg::sender();
+        let contract_addr = contract::address();
+        let balance = balance_of(token_out, sender);
+        if balance < amount_out {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INSUFFICIENT_BALANCE));
+        }
+
+        safe_transfer_from(token_out, sender, contract_addr, amount_out)?;
+
+        let next_id = self.next_order_id.get();
+        let new_id = next_id.checked_add(U256::from(1u64)).ok_or_else(|| {
+            unlock_reentrancy_guard(self);
+            err(ERR_OVERFLOW)
+        })?;
+        self.next_order_id.set(new_id);
+
+        let key = order_id_to_address(new_id);
+        self.order_owner.setter(key).set(sender);
+        self.order_token_in.setter(key).set(token_in);
+        self.order_token_out.setter(key).set(token_out);
+        self.order_amount_out.setter(key).set(amount_out);
+        self.order_trigger_price.setter(key).set(trigger_price);
+        self.order_type.setter(key).set(order_type);
+        self.order_status.setter(key).set(U256::ZERO); // Open
+        self.order_created_at.setter(key).set(U256::from(block::number()));
+
+        if !oco_with_order_id.is_zero() {
+            let oco_key = order_id_to_address(oco_with_order_id);
+            let oco_owner = self.order_owner.setter(oco_key).get();
+            if oco_owner == Address::ZERO {
+                unlock_reentrancy_guard(self);
+                return Err(err(ERR_OCO_PAIR_INVALID));
+            }
+            if oco_owner != sender {
+                unlock_reentrancy_guard(self);
+                return Err(err(ERR_ORDER_NOT_OWNER));
+            }
+            let oco_status = self.order_status.setter(oco_key).get();
+            if oco_status != U256::ZERO {
+                unlock_reentrancy_guard(self);
+                return Err(err(ERR_OCO_PAIR_INVALID));
+            }
+            self.order_oco_pair.setter(key).set(oco_with_order_id);
+            self.order_oco_pair.setter(oco_key).set(new_id);
+        }
+
+        emit_order_placed(new_id, sender, token_in, token_out, amount_out, trigger_price, order_type);
+        unlock_reentrancy_guard(self);
+        Ok(new_id)
+    }
+
+    /// Cancel an open order; returns escrowed tokens to the owner.
+    pub fn cancel_order(&mut self, order_id: U256) -> OakResult<()> {
+        lock_reentrancy_guard(self)?;
+        let sender = msg::sender();
+        let key = order_id_to_address(order_id);
+        let owner = self.order_owner.setter(key).get();
+        if owner == Address::ZERO {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_ORDER_NOT_FOUND));
+        }
+        if owner != sender {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_ORDER_NOT_OWNER));
+        }
+        let status = self.order_status.setter(key).get();
+        if status != U256::ZERO {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_ORDER_NOT_OPEN));
+        }
+        let token_out = self.order_token_out.setter(key).get();
+        let amount_out = self.order_amount_out.setter(key).get();
+        self.order_status.setter(key).set(U256::from(2u64)); // Cancelled
+        safe_transfer(token_out, sender, amount_out)?;
+        let oco_pair = self.order_oco_pair.setter(key).get();
+        if !oco_pair.is_zero() {
+            let oco_key = order_id_to_address(oco_pair);
+            self.order_oco_pair.setter(key).set(U256::ZERO);
+            self.order_oco_pair.setter(oco_key).set(U256::ZERO);
+        }
+        emit_order_cancelled(order_id, sender);
+        unlock_reentrancy_guard(self);
+        Ok(())
+    }
+
+    /// Execute an open order when price condition is met. Anyone may call.
+    ///
+    /// @param order_id Order to execute.
+    /// @param min_amount_out Minimum token_in to send to order owner (slippage).
+    pub fn execute_order(&mut self, order_id: U256, min_amount_out: U256) -> OakResult<U256> {
+        lock_reentrancy_guard(self)?;
+        let key = order_id_to_address(order_id);
+        let owner = self.order_owner.setter(key).get();
+        if owner == Address::ZERO {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_ORDER_NOT_FOUND));
+        }
+        let status = self.order_status.setter(key).get();
+        if status != U256::ZERO {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_ORDER_NOT_OPEN));
+        }
+        let token_in = self.order_token_in.setter(key).get();
+        let token_out = self.order_token_out.setter(key).get();
+        let amount_out = self.order_amount_out.setter(key).get();
+        let trigger_price = self.order_trigger_price.setter(key).get();
+        let order_type = self.order_type.setter(key).get();
+
+        let current_price = self.get_current_price(token_in, token_out)?;
+        let order_type_u = order_type.as_limbs()[0];
+        let condition_met = if order_type_u == 2 {
+            current_price <= trigger_price
+        } else {
+            current_price >= trigger_price
+        };
+        if !condition_met {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_ORDER_CONDITION_NOT_MET));
+        }
+
+        let contract_addr = contract::address();
+        let amount_in_received = process_swap_from_to(
+            self,
+            contract_addr,
+            owner,
+            token_out,
+            token_in,
+            amount_out,
+            min_amount_out,
+        )?;
+        self.order_status.setter(key).set(U256::from(1u64)); // Executed
+        emit_order_executed(order_id, owner, amount_in_received);
+
+        let oco_pair = self.order_oco_pair.setter(key).get();
+        if !oco_pair.is_zero() {
+            let oco_key = order_id_to_address(oco_pair);
+            let oco_owner = self.order_owner.setter(oco_key).get();
+            let oco_status = self.order_status.setter(oco_key).get();
+            if oco_owner != Address::ZERO && oco_status == U256::ZERO {
+                let oco_token_out = self.order_token_out.setter(oco_key).get();
+                let oco_amount_out = self.order_amount_out.setter(oco_key).get();
+                self.order_status.setter(oco_key).set(U256::from(2u64)); // Cancelled
+                safe_transfer(oco_token_out, oco_owner, oco_amount_out)?;
+                emit_order_cancelled(oco_pair, oco_owner);
+            }
+            self.order_oco_pair.setter(key).set(U256::ZERO);
+            self.order_oco_pair.setter(oco_key).set(U256::ZERO);
+        }
+
+        unlock_reentrancy_guard(self);
+        Ok(amount_in_received)
+    }
+
+    /// View: get order details by ID.
+    pub fn get_order(
+        &self,
+        order_id: U256,
+    ) -> OakResult<(Address, Address, Address, U256, U256, U256, U256, U256, U256)> {
+        let key = order_id_to_address(order_id);
+        let owner = self.order_owner.getter(key).get();
+        if owner == Address::ZERO {
+            return Err(err(ERR_ORDER_NOT_FOUND));
+        }
+        Ok((
+            owner,
+            self.order_token_in.getter(key).get(),
+            self.order_token_out.getter(key).get(),
+            self.order_amount_out.getter(key).get(),
+            self.order_trigger_price.getter(key).get(),
+            self.order_type.getter(key).get(),
+            self.order_status.getter(key).get(),
+            self.order_created_at.getter(key).get(),
+            self.order_oco_pair.getter(key).get(),
+        ))
+    }
+
+    /// View: current price (reserve_in / reserve_out) for token_in/token_out pair.
+    pub fn get_current_price(&self, token_in: Address, token_out: Address) -> OakResult<U256> {
+        let (r0, r1) = self.get_reserves(token_in, token_out)?;
+        let (reserve_in, reserve_out) = if token_in < token_out {
+            (r0, r1)
+        } else {
+            (r1, r0)
+        };
+        if reserve_out.is_zero() {
+            return Err(err(ERR_DIVISION_BY_ZERO));
+        }
+        Ok(reserve_in.checked_div(reserve_out).unwrap_or(U256::ZERO))
+    }
+
+    // ---------- Tracked positions (pro terminal: PnL, TP/SL, close) ----------
+
+    /// Open a tracked position after a swap (record size + entry price for PnL and TP/SL).
+    ///
+    /// @param base_token Token held (e.g. ETH); sold on close.
+    /// @param quote_token Token to receive on close (e.g. USDC).
+    /// @param size Amount of base token (18 decimals).
+    /// @param entry_price Quote per base (18 decimals; from get_current_price at open).
+    /// @param initial_collateral Optional margin in quote (18 decimals). If > 0, transferred from caller; used for liquidation price: liq_price = (collateral + margin_added) / size.
+    pub fn open_position(
+        &mut self,
+        base_token: Address,
+        quote_token: Address,
+        size: U256,
+        entry_price: U256,
+        initial_collateral: U256,
+    ) -> OakResult<U256> {
+        lock_reentrancy_guard(self)?;
+        require_non_zero_address(base_token)?;
+        require_non_zero_address(quote_token)?;
+        if base_token == quote_token {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INVALID_TOKEN));
+        }
+        if size.is_zero() {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INSUFFICIENT_INPUT_AMOUNT));
+        }
+        require_not_paused(self)?;
+
+        let sender = msg::sender();
+        let contract_addr = contract::address();
+        if !initial_collateral.is_zero() {
+            let bal = balance_of(quote_token, sender);
+            if bal < initial_collateral {
+                unlock_reentrancy_guard(self);
+                return Err(err(ERR_MARGIN_ZERO_OR_INSUFFICIENT));
+            }
+            safe_transfer_from(quote_token, sender, contract_addr, initial_collateral)?;
+            let prev = self.position_margin_balance.setter(quote_token).get();
+            self.position_margin_balance
+                .setter(quote_token)
+                .set(prev.checked_add(initial_collateral).ok_or_else(|| {
+                    unlock_reentrancy_guard(self);
+                    err(ERR_OVERFLOW)
+                })?);
+        }
+
+        let next_id = self.next_position_id.get();
+        let new_id = next_id.checked_add(U256::from(1u64)).ok_or_else(|| {
+            unlock_reentrancy_guard(self);
+            err(ERR_OVERFLOW)
+        })?;
+        self.next_position_id.set(new_id);
+
+        let key = position_id_to_address(new_id);
+        self.position_owner.setter(key).set(sender);
+        self.position_base.setter(key).set(base_token);
+        self.position_quote.setter(key).set(quote_token);
+        self.position_size.setter(key).set(size);
+        self.position_entry_price.setter(key).set(entry_price);
+        self.position_tp_price.setter(key).set(U256::ZERO);
+        self.position_sl_price.setter(key).set(U256::ZERO);
+        self.position_trailing_delta_bps.setter(key).set(U256::ZERO);
+        self.position_trailing_peak_price.setter(key).set(U256::ZERO);
+        self.position_initial_collateral.setter(key).set(initial_collateral);
+        self.position_margin_added.setter(key).set(U256::ZERO);
+        self.position_opened_at.setter(key).set(U256::from(block::number()));
+        self.position_status.setter(key).set(U256::ZERO); // Open
+
+        emit_open_position(new_id, sender, base_token, quote_token, size, entry_price);
+        unlock_reentrancy_guard(self);
+        Ok(new_id)
+    }
+
+    /// Add margin to an open position (increases collateral, does not change entry_price or size).
+    ///
+    /// @param amount Amount of quote token to add (18 decimals). Transferred from owner to contract.
+    /// Liquidation price becomes (initial_collateral + margin_added + amount) / size.
+    pub fn add_margin(&mut self, position_id: U256, amount: U256) -> OakResult<()> {
+        lock_reentrancy_guard(self)?;
+        if amount.is_zero() {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_MARGIN_ZERO_OR_INSUFFICIENT));
+        }
+        let sender = msg::sender();
+        let key = position_id_to_address(position_id);
+        let owner = self.position_owner.setter(key).get();
+        if owner == Address::ZERO {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_POSITION_NOT_FOUND));
+        }
+        if owner != sender {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_POSITION_NOT_OWNER));
+        }
+        let status = self.position_status.setter(key).get();
+        if status != U256::ZERO {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_POSITION_NOT_OPEN));
+        }
+        let quote_token = self.position_quote.setter(key).get();
+        let bal = balance_of(quote_token, sender);
+        if bal < amount {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_MARGIN_ZERO_OR_INSUFFICIENT));
+        }
+        let contract_addr = contract::address();
+        safe_transfer_from(quote_token, sender, contract_addr, amount)?;
+        let prev_added = self.position_margin_added.setter(key).get();
+        self.position_margin_added
+            .setter(key)
+            .set(prev_added.checked_add(amount).ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_OVERFLOW)
+            })?);
+        let prev_balance = self.position_margin_balance.setter(quote_token).get();
+        self.position_margin_balance
+            .setter(quote_token)
+            .set(prev_balance.checked_add(amount).ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_OVERFLOW)
+            })?);
+        unlock_reentrancy_guard(self);
+        Ok(())
+    }
+
+    /// Set or update Take-Profit and Stop-Loss prices for an open position.
+    ///
+    /// @param tp_price Execute when market price >= this (0 = clear TP).
+    /// @param sl_price Execute when market price <= this (0 = clear SL).
+    pub fn set_position_tp_sl(
+        &mut self,
+        position_id: U256,
+        tp_price: U256,
+        sl_price: U256,
+    ) -> OakResult<()> {
+        let sender = msg::sender();
+        let key = position_id_to_address(position_id);
+        let owner = self.position_owner.setter(key).get();
+        if owner == Address::ZERO {
+            return Err(err(ERR_POSITION_NOT_FOUND));
+        }
+        if owner != sender {
+            return Err(err(ERR_POSITION_NOT_OWNER));
+        }
+        let status = self.position_status.setter(key).get();
+        if status != U256::ZERO {
+            return Err(err(ERR_POSITION_NOT_OPEN));
+        }
+        self.position_tp_price.setter(key).set(tp_price);
+        self.position_sl_price.setter(key).set(sl_price);
+        emit_set_position_tp_sl(position_id, sender, tp_price, sl_price);
+        Ok(())
+    }
+
+    /// Set trailing stop-loss for an open position (owner only).
+    ///
+    /// @param trailing_delta_bps Delta in basis points (e.g. 100 = 1%). Trigger when oracle price <= peak * (10000 - delta_bps) / 10000. Max 10000.
+    /// @dev Initial peak is set to entry_price; off-chain bot updates peak via update_trailing_stop when price rises.
+    pub fn set_position_trailing_stop(
+        &mut self,
+        position_id: U256,
+        trailing_delta_bps: U256,
+    ) -> OakResult<()> {
+        let sender = msg::sender();
+        let key = position_id_to_address(position_id);
+        let owner = self.position_owner.setter(key).get();
+        if owner == Address::ZERO {
+            return Err(err(ERR_POSITION_NOT_FOUND));
+        }
+        if owner != sender {
+            return Err(err(ERR_POSITION_NOT_OWNER));
+        }
+        let status = self.position_status.setter(key).get();
+        if status != U256::ZERO {
+            return Err(err(ERR_POSITION_NOT_OPEN));
+        }
+        let delta = trailing_delta_bps.as_limbs()[0];
+        if delta == 0 || delta > 10_000 {
+            return Err(err(ERR_INVALID_ORDER_TYPE)); // reuse or add ERR_INVALID_DELTA
+        }
+        self.position_trailing_delta_bps.setter(key).set(trailing_delta_bps);
+        let entry = self.position_entry_price.setter(key).get();
+        self.position_trailing_peak_price.setter(key).set(entry);
+        emit_set_position_trailing(position_id, sender, trailing_delta_bps, entry);
+        Ok(())
+    }
+
+    /// Update trailing stop (call by off-chain bot on each oracle price tick).
+    ///
+    /// If new_price > peak, peak is updated. If new_price <= peak * (10000 - delta_bps) / 10000, position is closed
+    /// (base transferred from owner to contract, swapped to quote, sent to owner). Owner must have approved the contract.
+    ///
+    /// @param new_price Current oracle price (quote per base, 18 decimals).
+    /// @param min_amount_out Minimum quote to receive (slippage).
+    pub fn update_trailing_stop(
+        &mut self,
+        position_id: U256,
+        new_price: U256,
+        min_amount_out: U256,
+    ) -> OakResult<U256> {
+        lock_reentrancy_guard(self)?;
+        let key = position_id_to_address(position_id);
+        let owner = self.position_owner.setter(key).get();
+        if owner == Address::ZERO {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_POSITION_NOT_FOUND));
+        }
+        let status = self.position_status.setter(key).get();
+        if status != U256::ZERO {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_POSITION_NOT_OPEN));
+        }
+        let delta_bps = self.position_trailing_delta_bps.setter(key).get();
+        if delta_bps.is_zero() {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_TRAILING_DISABLED));
+        }
+        let mut peak = self.position_trailing_peak_price.setter(key).get();
+        if new_price > peak {
+            peak = new_price;
+            self.position_trailing_peak_price.setter(key).set(peak);
+        }
+        let bps_u = as_u256(10_000u64);
+        let trigger_num = peak
+            .checked_mul(bps_u.saturating_sub(delta_bps))
+            .ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_OVERFLOW)
+            })?;
+        let trigger_price = trigger_num
+            .checked_div(bps_u)
+            .ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_DIVISION_BY_ZERO)
+            })?;
+        if new_price > trigger_price {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_TRAILING_NOT_TRIGGERED));
+        }
+        let base_token = self.position_base.setter(key).get();
+        let quote_token = self.position_quote.setter(key).get();
+        let size = self.position_size.setter(key).get();
+        let initial_collateral = self.position_initial_collateral.setter(key).get();
+        let margin_added = self.position_margin_added.setter(key).get();
+        let margin_total = initial_collateral
+            .checked_add(margin_added)
+            .ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_OVERFLOW)
+            })?;
+        if !margin_total.is_zero() {
+            let prev = self.position_margin_balance.setter(quote_token).get();
+            self.position_margin_balance
+                .setter(quote_token)
+                .set(prev.checked_sub(margin_total).ok_or_else(|| {
+                    unlock_reentrancy_guard(self);
+                    err(ERR_OVERFLOW)
+                })?);
+            self.position_initial_collateral.setter(key).set(U256::ZERO);
+            self.position_margin_added.setter(key).set(U256::ZERO);
+            safe_transfer(quote_token, owner, margin_total)?;
+        }
+        let amount_out = process_swap_from_to(
+            self,
+            owner,
+            owner,
+            base_token,
+            quote_token,
+            size,
+            min_amount_out,
+        )?;
+        self.position_status.setter(key).set(U256::from(1u64)); // Closed
+        emit_close_position(position_id, owner, amount_out);
+        emit_trailing_stop_triggered(position_id, owner, peak, trigger_price, amount_out);
+        unlock_reentrancy_guard(self);
+        Ok(amount_out)
+    }
+
+    /// Close an open position: return margin to owner, market-sell base for quote, mark closed.
+    ///
+    /// @param min_amount_out Slippage protection (minimum quote to receive from swap).
+    pub fn close_position(&mut self, position_id: U256, min_amount_out: U256) -> OakResult<U256> {
+        lock_reentrancy_guard(self)?;
+        require_not_paused(self)?;
+        let sender = msg::sender();
+        let key = position_id_to_address(position_id);
+        let owner = self.position_owner.setter(key).get();
+        if owner == Address::ZERO {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_POSITION_NOT_FOUND));
+        }
+        if owner != sender {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_POSITION_NOT_OWNER));
+        }
+        let status = self.position_status.setter(key).get();
+        if status != U256::ZERO {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_POSITION_NOT_OPEN));
+        }
+
+        let base_token = self.position_base.setter(key).get();
+        let quote_token = self.position_quote.setter(key).get();
+        let size = self.position_size.setter(key).get();
+        let initial_collateral = self.position_initial_collateral.setter(key).get();
+        let margin_added = self.position_margin_added.setter(key).get();
+        let margin_total = initial_collateral
+            .checked_add(margin_added)
+            .ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_OVERFLOW)
+            })?;
+
+        if !margin_total.is_zero() {
+            let prev = self.position_margin_balance.setter(quote_token).get();
+            self.position_margin_balance
+                .setter(quote_token)
+                .set(prev.checked_sub(margin_total).ok_or_else(|| {
+                    unlock_reentrancy_guard(self);
+                    err(ERR_OVERFLOW)
+                })?);
+            self.position_initial_collateral.setter(key).set(U256::ZERO);
+            self.position_margin_added.setter(key).set(U256::ZERO);
+            safe_transfer(quote_token, owner, margin_total)?;
+        }
+
+        let amount_out = process_swap_from_to(
+            self,
+            sender,
+            sender,
+            base_token,
+            quote_token,
+            size,
+            min_amount_out,
+        )?;
+        self.position_status.setter(key).set(U256::from(1u64)); // Closed
+        emit_close_position(position_id, sender, amount_out);
+        unlock_reentrancy_guard(self);
+        Ok(amount_out)
+    }
+
+    /// Execute TP/SL for a position if condition met (anyone may call; keeper-friendly).
+    ///
+    /// @param min_amount_out Slippage when closing.
+    pub fn execute_position_tp_sl(
+        &mut self,
+        position_id: U256,
+        min_amount_out: U256,
+    ) -> OakResult<U256> {
+        require_not_paused(self)?;
+        let key = position_id_to_address(position_id);
+        let owner = self.position_owner.setter(key).get();
+        if owner == Address::ZERO {
+            return Err(err(ERR_POSITION_NOT_FOUND));
+        }
+        let status = self.position_status.setter(key).get();
+        if status != U256::ZERO {
+            return Err(err(ERR_POSITION_NOT_OPEN));
+        }
+        let base_token = self.position_base.setter(key).get();
+        let quote_token = self.position_quote.setter(key).get();
+        let tp_price = self.position_tp_price.setter(key).get();
+        let sl_price = self.position_sl_price.setter(key).get();
+        if tp_price.is_zero() && sl_price.is_zero() {
+            return Err(err(ERR_POSITION_TP_SL_NOT_MET));
+        }
+        let current_price = self.get_current_price(base_token, quote_token)?;
+        let tp_met = !tp_price.is_zero() && current_price >= tp_price;
+        let sl_met = !sl_price.is_zero() && current_price <= sl_price;
+        if !tp_met && !sl_met {
+            return Err(err(ERR_POSITION_TP_SL_NOT_MET));
+        }
+        self.close_position(position_id, min_amount_out)
+    }
+
+    /// View: get position by ID.
+    pub fn get_position(
+        &self,
+        position_id: U256,
+    ) -> OakResult<(
+        Address,
+        Address,
+        Address,
+        U256,
+        U256,
+        U256,
+        U256,
+        U256,
+        U256,
+        U256,
+        U256,
+        U256,
+        U256,
+    )> {
+        let key = position_id_to_address(position_id);
+        let owner = self.position_owner.getter(key).get();
+        if owner == Address::ZERO {
+            return Err(err(ERR_POSITION_NOT_FOUND));
+        }
+        Ok((
+            owner,
+            self.position_base.getter(key).get(),
+            self.position_quote.getter(key).get(),
+            self.position_size.getter(key).get(),
+            self.position_entry_price.getter(key).get(),
+            self.position_tp_price.getter(key).get(),
+            self.position_sl_price.getter(key).get(),
+            self.position_trailing_delta_bps.getter(key).get(),
+            self.position_trailing_peak_price.getter(key).get(),
+            self.position_initial_collateral.getter(key).get(),
+            self.position_margin_added.getter(key).get(),
+            self.position_opened_at.getter(key).get(),
+            self.position_status.getter(key).get(),
+        ))
+    }
+
+    /// View: liquidation price and health factor for a position (for frontend / liquidator).
+    ///
+    /// Liquidation price (long) = (initial_collateral + margin_added) / size (quote per base, 18 decimals).
+    /// When mark_price <= liquidation_price, position is undercollateralized.
+    /// Health factor (basis points) = current_price * 10_000 / liquidation_price. HF > 10_000 = healthy; HF <= 10_000 = at or below liquidation.
+    ///
+    /// @return (liquidation_price, health_factor_bps). If size is 0 or total margin is 0, liquidation_price is 0 and health_factor_bps is 0.
+    pub fn get_position_health(
+        &self,
+        position_id: U256,
+    ) -> OakResult<(U256, U256)> {
+        let key = position_id_to_address(position_id);
+        let owner = self.position_owner.getter(key).get();
+        if owner == Address::ZERO {
+            return Err(err(ERR_POSITION_NOT_FOUND));
+        }
+        let base_token = self.position_base.getter(key).get();
+        let quote_token = self.position_quote.getter(key).get();
+        let size = self.position_size.getter(key).get();
+        let initial_collateral = self.position_initial_collateral.getter(key).get();
+        let margin_added = self.position_margin_added.getter(key).get();
+        let total_margin = initial_collateral
+            .checked_add(margin_added)
+            .unwrap_or(U256::ZERO);
+        let liquidation_price = if size.is_zero() {
+            U256::ZERO
+        } else {
+            total_margin.checked_div(size).unwrap_or(U256::ZERO)
+        };
+        let health_factor_bps = if liquidation_price.is_zero() {
+            U256::ZERO
+        } else {
+            let current_price = self.get_current_price(base_token, quote_token).unwrap_or(U256::ZERO);
+            current_price
+                .checked_mul(as_u256(10_000u64))
+                .and_then(|n| n.checked_div(liquidation_price))
+                .unwrap_or(U256::ZERO)
+        };
+        Ok((liquidation_price, health_factor_bps))
+    }
+
+    /// View: next position ID (so indexers/frontends can scan 1..next_position_id - 1 for open positions).
+    pub fn get_next_position_id(&self) -> U256 {
+        self.next_position_id.get()
+    }
+
+    /// One-click close position: swap full amount of token_from for token_to (single hop).
+    ///
+    /// @param amount_in Amount of token_from to sell (e.g. user's balance; frontend passes it).
+    pub fn close_position_market(
+        &mut self,
+        amount_in: U256,
+        token_from: Address,
+        token_to: Address,
+        min_amount_out: U256,
+    ) -> OakResult<U256> {
+        if amount_in.is_zero() {
+            return Err(err(ERR_INSUFFICIENT_INPUT_AMOUNT));
+        }
+        lock_reentrancy_guard(self)?;
+        let out = process_swap(self, token_from, token_to, amount_in, min_amount_out)?;
+        unlock_reentrancy_guard(self);
+        Ok(out)
     }
 
     /// Cancel an expired or unwanted commitment.
@@ -1313,26 +2350,14 @@ impl OakDEX {
         Ok(())
     }
 
-    /// Withdraw accrued treasury fees.
+    /// Withdraw (claim) accrued treasury fees for a given token.
     ///
-    /// @notice Owner-only function to transfer accumulated treasury fees (0.12% of swaps)
-    ///         to the treasury address.
-    /// @dev Resets the accrued counter after withdrawal to prevent double-spending.
-    ///
-    /// # Arguments
-    /// * `token` - Address of the token to withdraw (must be token0)
-    ///
-    /// # Returns
-    /// `Ok(())` on success, error if no fees available or transfer fails
+    /// @notice Owner-only. Transfers per-token treasury balance (20% of fees) to treasury address.
+    /// @dev 60/20/20 model: 20% Treasury, 20% Buyback, 60% LP. Resets balance after transfer.
     pub fn withdraw_treasury_fees(&mut self, token: Address) -> OakResult<()> {
-        // Owner check
         let owner = self.owner.get();
         only_owner(owner)?;
-
-        // Input sanitization: validate token address
         require_non_zero_address(token)?;
-
-        // Re-entrancy guard
         lock_reentrancy_guard(self)?;
 
         let treasury = self.treasury.get();
@@ -1340,24 +2365,307 @@ impl OakDEX {
             unlock_reentrancy_guard(self);
             return Err(err(ERR_INVALID_OWNER));
         }
+        let contract_addr = contract::address();
+        if treasury == contract_addr {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_TREASURY_IS_CONTRACT));
+        }
 
-        let accrued = self.accrued_treasury_fees_token0.get();
+        let accrued = self.treasury_balance.setter(token).get();
         if accrued.is_zero() {
             unlock_reentrancy_guard(self);
             return Err(err(ERR_NO_TREASURY_FEES));
         }
+        let contract_balance = balance_of(token, contract_addr);
+        if contract_balance < accrued {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INSUFFICIENT_LIQUIDITY));
+        }
 
-        // Reset counter before transfer (CEI pattern)
-        self.accrued_treasury_fees_token0.set(U256::ZERO);
-
-        // Transfer to treasury
+        self.treasury_balance.setter(token).set(U256::ZERO);
         safe_transfer(token, treasury, accrued)?;
-
         emit_withdraw_treasury_fees(treasury, token, accrued);
-
-        // Release re-entrancy guard
         unlock_reentrancy_guard(self);
+        Ok(())
+    }
 
+    /// Protocol analytics: total trading volume (global).
+    ///
+    /// @notice For dashboards and grant reviewers. Use get_treasury_balance(token) for per-token fees.
+    pub fn get_protocol_analytics(&self) -> OakResult<(U256, U256)> {
+        Ok((
+            self.total_volume_token0.get(),
+            self.total_volume_token1.get(),
+        ))
+    }
+
+    /// Treasury balance for a token (claimable by owner via withdraw_treasury_fees).
+    pub fn get_treasury_balance(&self, token: Address) -> OakResult<U256> {
+        Ok(self.treasury_balance.getter(token).get())
+    }
+
+    /// Buyback fund balance for a token (20% of fees; for OAK buyback).
+    pub fn get_buyback_balance(&self, token: Address) -> OakResult<U256> {
+        Ok(self.buyback_balance.getter(token).get())
+    }
+
+    /// Trade impact for frontends: expected amounts, price impact per hop, fee per hop.
+    ///
+    /// @notice CEX-grade view: amount_out, price_impact_bps, fee in input token per hop.
+    pub fn calculate_trade_impact(
+        &self,
+        amount_in: U256,
+        path: Vec<Address>,
+    ) -> OakResult<(Vec<U256>, Vec<U256>, Vec<U256>)> {
+        if path.len() as u64 > MAX_PATH_LENGTH {
+            return Err(err(ERR_PATH_TOO_LONG));
+        }
+        let amounts = self.get_amounts_out(amount_in, path.clone())?;
+        let fee_bps = self.protocol_fee_bps.get();
+        let mut impacts = Vec::with_capacity(amounts.len().saturating_sub(1));
+        let mut fees = Vec::with_capacity(amounts.len().saturating_sub(1));
+
+        for i in 0..(path.len().saturating_sub(1)) {
+            let input = path[i];
+            let output = path[i + 1];
+            let (token0, token1) = if input < output {
+                (input, output)
+            } else {
+                (output, input)
+            };
+            let outer = self.pools.getter(token0);
+            let pool = outer.getter(token1);
+            if !pool.initialized.get() {
+                return Err(err(ERR_INVALID_TOKEN));
+            }
+            let (reserve_in, reserve_out) = if input == token0 {
+                (pool.reserve0.get(), pool.reserve1.get())
+            } else {
+                (pool.reserve1.get(), pool.reserve0.get())
+            };
+            let amt_in = amounts[i];
+            let amt_out = amounts[i + 1];
+
+            let fee_hop = amt_in
+                .checked_mul(fee_bps)
+                .ok_or_else(|| err(ERR_OVERFLOW))?
+                .checked_div(as_u256(FEE_DENOMINATOR))
+                .unwrap_or(U256::ZERO);
+            fees.push(fee_hop);
+
+            let impact_num = amt_out
+                .checked_mul(reserve_in)
+                .ok_or_else(|| err(ERR_OVERFLOW))?
+                .checked_mul(as_u256(BPS))
+                .ok_or_else(|| err(ERR_OVERFLOW))?;
+            let impact_den = amt_in.checked_mul(reserve_out).ok_or_else(|| err(ERR_OVERFLOW))?;
+            let impact_bps = if impact_den.is_zero() {
+                U256::ZERO
+            } else {
+                impact_num.checked_div(impact_den).unwrap_or(U256::ZERO)
+            };
+            let price_impact_bps = as_u256(BPS)
+                .checked_sub(impact_bps)
+                .unwrap_or(U256::ZERO)
+                .min(U256::from(10000u64));
+            impacts.push(price_impact_bps);
+        }
+
+        Ok((amounts, impacts, fees))
+    }
+
+    /// LP position: balance and pool share in basis points.
+    pub fn get_lp_position(
+        &self,
+        user: Address,
+        token_a: Address,
+        token_b: Address,
+    ) -> OakResult<(U256, U256)> {
+        require_non_zero_address(token_a)?;
+        require_non_zero_address(token_b)?;
+        let (token0, token1) = if token_a < token_b {
+            (token_a, token_b)
+        } else {
+            (token_b, token_a)
+        };
+        let outer = self.pools.getter(token0);
+        let pool = outer.getter(token1);
+        if !pool.initialized.get() {
+            return Err(err(ERR_INVALID_TOKEN));
+        }
+        let balance = pool.lp_balances.getter(user).get();
+        let total = pool.lp_total_supply.get();
+        let share_bps = if total.is_zero() {
+            U256::ZERO
+        } else {
+            balance
+                .checked_mul(U256::from(10000u64))
+                .ok_or_else(|| err(ERR_OVERFLOW))?
+                .checked_div(total)
+                .unwrap_or(U256::ZERO)
+        };
+        Ok((balance, share_bps))
+    }
+
+    /// Amounts in required along path to get exact amount_out (last element). Rounds up per hop (protocol-safe).
+    pub fn get_amounts_in(
+        &self,
+        amount_out: U256,
+        path: Vec<Address>,
+    ) -> OakResult<Vec<U256>> {
+        if path.len() < 2 {
+            return Err(err(ERR_INVALID_PATH));
+        }
+        if path.len() as u64 > MAX_PATH_LENGTH {
+            return Err(err(ERR_PATH_TOO_LONG));
+        }
+        if amount_out.is_zero() {
+            return Err(err(ERR_INSUFFICIENT_OUTPUT_AMOUNT));
+        }
+        let fee_bps = self.protocol_fee_bps.get();
+        let mut amounts = Vec::with_capacity(path.len());
+        let mut current_out = amount_out;
+        for i in (0..path.len()).rev() {
+            amounts.push(current_out);
+            if i == 0 {
+                break;
+            }
+            let output = path[i];
+            let input = path[i - 1];
+            if input == output {
+                return Err(err(ERR_INVALID_PATH));
+            }
+            let (token0, token1) = if input < output {
+                (input, output)
+            } else {
+                (output, input)
+            };
+            let outer = self.pools.getter(token0);
+            let pool = outer.getter(token1);
+            if !pool.initialized.get() {
+                return Err(err(ERR_INVALID_TOKEN));
+            }
+            let (reserve_in, reserve_out) = if input == token0 {
+                (pool.reserve0.get(), pool.reserve1.get())
+            } else {
+                (pool.reserve1.get(), pool.reserve0.get())
+            };
+            current_out = get_amount_in_with_fee(current_out, reserve_in, reserve_out, fee_bps)?;
+        }
+        amounts.reverse();
+        Ok(amounts)
+    }
+
+    /// Quote: same as calculate_trade_impact (amounts, price_impact_bps per hop, fee per hop).
+    pub fn get_quote(
+        &self,
+        amount_in: U256,
+        path: Vec<Address>,
+    ) -> OakResult<(Vec<U256>, Vec<U256>, Vec<U256>)> {
+        self.calculate_trade_impact(amount_in, path)
+    }
+
+    /// Impermanent loss estimate in basis points (pool-level). IL = 2*sqrt(r)/(1+r) - 1 where r = reserve1/reserve0.
+    /// Returns approximate IL in bps (negative = loss). Uses scaled math to avoid overflow.
+    pub fn get_impermanent_loss_bps(
+        &self,
+        token_a: Address,
+        token_b: Address,
+    ) -> OakResult<U256> {
+        require_non_zero_address(token_a)?;
+        require_non_zero_address(token_b)?;
+        let (token0, token1) = if token_a < token_b {
+            (token_a, token_b)
+        } else {
+            (token_b, token_a)
+        };
+        let outer = self.pools.getter(token0);
+        let pool = outer.getter(token1);
+        if !pool.initialized.get() {
+            return Err(err(ERR_INVALID_TOKEN));
+        }
+        let r0 = pool.reserve0.get();
+        let r1 = pool.reserve1.get();
+        if r0.is_zero() {
+            return Ok(U256::ZERO);
+        }
+        let ratio_bps = r1
+            .checked_mul(as_u256(BPS))
+            .ok_or_else(|| err(ERR_OVERFLOW))?
+            .checked_div(r0)
+            .ok_or_else(|| err(ERR_DIVISION_BY_ZERO))?;
+        let ratio_scaled = ratio_bps.checked_mul(as_u256(BPS)).ok_or_else(|| err(ERR_OVERFLOW))?;
+        let sqrt_r = u256_sqrt(ratio_scaled);
+        let two_sqrt = sqrt_r.checked_mul(U256::from(2u64)).ok_or_else(|| err(ERR_OVERFLOW))?;
+        let denom = as_u256(BPS).checked_add(ratio_bps).ok_or_else(|| err(ERR_OVERFLOW))?;
+        let value_lp_bps = two_sqrt
+            .checked_mul(as_u256(BPS))
+            .ok_or_else(|| err(ERR_OVERFLOW))?
+            .checked_div(denom)
+            .ok_or_else(|| err(ERR_DIVISION_BY_ZERO))?;
+        let il_bps = value_lp_bps.saturating_sub(as_u256(BPS));
+        Ok(il_bps)
+    }
+
+    /// Dynamic fee hook: currently returns base protocol fee. Future: volatility-based adjustment.
+    pub fn get_dynamic_fee_bps(&self, _token_a: Address, _token_b: Address) -> OakResult<U256> {
+        Ok(self.protocol_fee_bps.get())
+    }
+
+    /// Manually trigger circuit breaker (owner only). Stops swaps until cleared. Audit event.
+    pub fn trigger_circuit_breaker(&mut self) -> OakResult<()> {
+        only_owner(self.owner.get())?;
+        self.circuit_breaker_triggered.set(true);
+        emit_circuit_breaker_triggered(U256::ZERO); // 0 = manual trigger
+        Ok(())
+    }
+
+    /// Clear circuit breaker (owner only). Re-enables swaps. Audit event.
+    pub fn clear_circuit_breaker(&mut self) -> OakResult<()> {
+        only_owner(self.owner.get())?;
+        self.circuit_breaker_triggered.set(false);
+        emit_circuit_breaker_cleared();
+        Ok(())
+    }
+
+    /// Set buyback wallet (owner only). Can set to zero to disable.
+    pub fn set_buyback_wallet(&mut self, wallet: Address) -> OakResult<()> {
+        only_owner(self.owner.get())?;
+        self.buyback_wallet.set(wallet);
+        emit_buyback_wallet_set(wallet);
+        Ok(())
+    }
+
+    /// Two-step ownership transfer (DoD-style). Pending owner must call accept_owner() after delay.
+    pub fn set_pending_owner(&mut self, pending: Address) -> OakResult<()> {
+        only_owner(self.owner.get())?;
+        let after_block = U256::from(block::number())
+            .checked_add(as_u256(OWNER_TRANSFER_DELAY_BLOCKS))
+            .ok_or_else(|| err(ERR_OVERFLOW))?;
+        self.pending_owner.set(pending);
+        self.owner_transfer_after_block.set(after_block);
+        emit_pending_owner_set(pending, after_block);
+        Ok(())
+    }
+
+    /// Accept ownership (callable only by pending owner after delay).
+    pub fn accept_owner(&mut self) -> OakResult<()> {
+        let pending = self.pending_owner.get();
+        if pending == Address::ZERO {
+            return Err(err(ERR_NO_PENDING_OWNER));
+        }
+        if msg::sender() != pending {
+            return Err(err(ERR_PENDING_OWNER_ONLY));
+        }
+        let after_block = self.owner_transfer_after_block.get();
+        if U256::from(block::number()) < after_block {
+            return Err(err(ERR_OWNER_TRANSFER_TOO_EARLY));
+        }
+        let old = self.owner.get();
+        self.owner.set(pending);
+        self.pending_owner.set(Address::ZERO);
+        self.owner_transfer_after_block.set(U256::ZERO);
+        emit_owner_changed(old, pending);
         Ok(())
     }
 
@@ -1538,12 +2846,12 @@ impl OakDEX {
             call_data.push(0u8);
         }
         
-        // Make the external call - this will revert if callback fails
-        // The callback must transfer the repayment tokens back to this contract
-        let call = Call::new_in(borrower);
-        if let Err(e) = call.call_raw(&call_data, false) {
+        // Make the external call - this will revert if callback fails.
+        // The callback must transfer the repayment tokens back to this contract.
+        // Stylus call API: call::call(context, to, data).
+        if let Err(e) = call::call(Call::new(), borrower, &call_data) {
             unlock_reentrancy_guard(self);
-            return Err(e);
+            return Err(e.into());
         }
 
         // Verify repayment: check contract balances after callback
@@ -1670,62 +2978,46 @@ impl OakDEX {
             self.total_volume_token1.set(new_volume1);
         }
 
-        // Update fee accounting
+        // Update fee accounting (60/20/20: per-token treasury and buyback)
         if !fee0.is_zero() {
-            let (_effective_in, treasury_fee0, lp_fee0) =
+            let (_e, treasury_fee0, _lp0, buyback_fee0) =
                 match compute_fee_split(amount0_out, fee_bps) {
-                    Ok(split) => split,
+                    Ok(s) => s,
                     Err(e) => {
                         unlock_reentrancy_guard(self);
                         return Err(e);
                     }
                 };
-
-            let current_treasury_fees = self.accrued_treasury_fees_token0.get();
-            let current_lp_fees = self.accrued_lp_fees_token0.get();
-
-            let new_treasury_fees = current_treasury_fees
-                .checked_add(treasury_fee0)
-                .ok_or_else(|| {
-                    unlock_reentrancy_guard(self);
-                    err(ERR_OVERFLOW)
-                })?;
-            let new_lp_fees = current_lp_fees
-                .checked_add(lp_fee0)
-                .ok_or_else(|| {
-                    unlock_reentrancy_guard(self);
-                    err(ERR_OVERFLOW)
-                })?;
-
-            self.accrued_treasury_fees_token0.set(new_treasury_fees);
-            self.accrued_lp_fees_token0.set(new_lp_fees);
-
-            // Gas-rebate placeholder: track a small portion of protocol fee (token0 side).
-            let total_fee0 = treasury_fee0
-                .checked_add(lp_fee0)
-                .ok_or_else(|| {
-                    unlock_reentrancy_guard(self);
-                    err(ERR_OVERFLOW)
-                })?;
-            let gas_rebate = total_fee0
-                .checked_mul(as_u256(GAS_REBATE_BPS))
-                .ok_or_else(|| {
-                    unlock_reentrancy_guard(self);
-                    err(ERR_OVERFLOW)
-                })?
-                .checked_div(as_u256(FEE_DENOMINATOR))
-                .ok_or_else(|| {
-                    unlock_reentrancy_guard(self);
-                    err(ERR_DIVISION_BY_ZERO)
-                })?;
-            if !gas_rebate.is_zero() {
-                let acc = self.accrued_gas_rebate_token0.get();
-                let new_acc = acc.checked_add(gas_rebate).ok_or_else(|| {
-                    unlock_reentrancy_guard(self);
-                    err(ERR_OVERFLOW)
-                })?;
-                self.accrued_gas_rebate_token0.set(new_acc);
-            }
+            let pt = self.treasury_balance.setter(token0);
+            let pb = self.buyback_balance.setter(token0);
+            pt.set(pt.get().checked_add(treasury_fee0).ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_OVERFLOW)
+            })?);
+            pb.set(pb.get().checked_add(buyback_fee0).ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_OVERFLOW)
+            })?);
+        }
+        if !fee1.is_zero() {
+            let (_e, treasury_fee1, _lp1, buyback_fee1) =
+                match compute_fee_split(amount1_out, fee_bps) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        unlock_reentrancy_guard(self);
+                        return Err(e);
+                    }
+                };
+            let pt = self.treasury_balance.setter(token1);
+            let pb = self.buyback_balance.setter(token1);
+            pt.set(pt.get().checked_add(treasury_fee1).ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_OVERFLOW)
+            })?);
+            pb.set(pb.get().checked_add(buyback_fee1).ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_OVERFLOW)
+            })?);
         }
 
         // Emit FlashSwap event
@@ -1785,21 +3077,22 @@ mod tests {
         let amount_in = U256::from(1_000_000u64);
         let fee_bps = as_u256(DEFAULT_FEE_BPS);
 
-        let (_effective_in, treasury_fee, lp_fee) =
+        let (_effective_in, treasury_fee, lp_fee, buyback_fee) =
             compute_fee_split(amount_in, fee_bps).unwrap();
 
         // Total fee should be 0.3% of amount_in.
-        let total_fee = treasury_fee + lp_fee;
+        let total_fee = treasury_fee + lp_fee + buyback_fee;
         let expected_total_fee = amount_in * as_u256(DEFAULT_FEE_BPS) / as_u256(FEE_DENOMINATOR);
         assert_eq!(total_fee, expected_total_fee);
 
-        // Treasury share should be 0.12% and LP share 0.18% of amount_in (within integer rounding).
-        let expected_treasury =
-            amount_in * as_u256(TREASURY_FEE_BPS) / as_u256(FEE_DENOMINATOR);
-        let expected_lp = amount_in * as_u256(LP_FEE_BPS) / as_u256(FEE_DENOMINATOR);
+        // 60% LP, 20% Treasury, 20% Buyback of total fee.
+        let expected_treasury = total_fee * as_u256(TREASURY_FEE_PCT) / U256::from(100u64);
+        let expected_lp = total_fee * as_u256(LP_FEE_PCT) / U256::from(100u64);
+        let expected_buyback = total_fee * as_u256(BUYBACK_FEE_PCT) / U256::from(100u64);
 
         assert_eq!(treasury_fee, expected_treasury);
         assert_eq!(lp_fee, expected_lp);
+        assert_eq!(buyback_fee, expected_buyback);
     }
 
     #[test]
@@ -1822,7 +3115,7 @@ mod tests {
         let amount_in = U256::from(1_000_001u64); // 1M + 1 (tests rounding)
         let fee_bps = as_u256(DEFAULT_FEE_BPS);
 
-        let (_effective_in, treasury_fee, lp_fee) =
+        let (_effective_in, treasury_fee, lp_fee, buyback_fee) =
             compute_fee_split(amount_in, fee_bps).unwrap();
 
         // Calculate expected total fee
@@ -1832,15 +3125,17 @@ mod tests {
             .checked_div(as_u256(FEE_DENOMINATOR))
             .unwrap();
 
-        // Verify: treasury_fee + lp_fee = total_fee exactly (no precision loss)
+        // Verify: treasury_fee + lp_fee + buyback_fee = total_fee exactly (no precision loss)
         let actual_total_fee = treasury_fee
             .checked_add(lp_fee)
+            .unwrap()
+            .checked_add(buyback_fee)
             .unwrap();
 
         assert_eq!(
             actual_total_fee, expected_total_fee,
-            "Fee split must not lose precision: {} + {} = {}, expected {}",
-            treasury_fee, lp_fee, actual_total_fee, expected_total_fee
+            "Fee split must not lose precision: treasury+lp+buyback = {}, expected {}",
+            actual_total_fee, expected_total_fee
         );
 
         // Verify effective_in calculation

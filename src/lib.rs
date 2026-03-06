@@ -12,6 +12,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 use stylus_sdk::prelude::*;
 
+/// Access Control by roles (DEFAULT_ADMIN_ROLE, PAUSER_ROLE, UPGRADER_ROLE).
+pub mod access;
 /// Protocol-wide constants (fees, limits, timing).
 pub mod constants;
 /// Shared error types and helpers.
@@ -20,6 +22,10 @@ pub mod errors;
 pub mod events;
 /// Persistent storage layout for the DEX.
 pub mod state;
+/// Pausable trait and implementation for OakDEX.
+pub mod pausable;
+/// TimelockController: queue -> delay -> execute.
+pub mod timelock;
 /// Core business logic (CPMM, commit‑reveal, admin).
 pub mod logic;
 /// ERC-20 token interface and transfer utilities.

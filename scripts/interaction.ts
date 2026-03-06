@@ -25,7 +25,7 @@ const OAK_PROTOCOL_ABI = [
     "function init(address initialOwner, address treasury) external",
     "function commitSwap(bytes32 hash) external",
     "function revealSwap(address token0, address token1, uint256 amountIn, uint256 salt, uint256 minAmountOut) external",
-    "function addLiquidity(address token0, address token1, uint256 amount0, uint256 amount1) external",
+    "function addLiquidity(address token0, address token1, uint256 amount0, uint256 amount1, uint256 amount0Min, uint256 amount1Min) external",
     "function paused() external view returns (bool)",
     "event CommitSwap(address indexed user, bytes32 hash, uint256 blockNumber)",
     "event RevealSwap(address indexed user, uint256 amountIn, uint256 amountOut, uint256 treasuryFee, uint256 lpFee)",
@@ -202,7 +202,7 @@ async function revealSwap(
 }
 
 /**
- * Add liquidity to the pool.
+ * Add liquidity to the pool (with slippage protection: amount0Min, amount1Min).
  */
 async function addLiquidity(
     contractAddress: string,
@@ -210,16 +210,18 @@ async function addLiquidity(
     token1: string,
     amount0: string,
     amount1: string,
+    amount0Min: string,
+    amount1Min: string,
     signer: ethers.Signer
 ): Promise<void> {
     console.log("\n💧 Adding liquidity...");
-    console.log(`   Token0: ${token0}, Amount: ${amount0}`);
-    console.log(`   Token1: ${token1}, Amount: ${amount1}`);
+    console.log(`   Token0: ${token0}, Amount: ${amount0}, Min: ${amount0Min}`);
+    console.log(`   Token1: ${token1}, Amount: ${amount1}, Min: ${amount1Min}`);
     
     const contract = new ethers.Contract(contractAddress, OAK_PROTOCOL_ABI, signer);
     
     try {
-        const tx = await contract.addLiquidity(token0, token1, amount0, amount1);
+        const tx = await contract.addLiquidity(token0, token1, amount0, amount1, amount0Min, amount1Min);
         console.log(`📤 Transaction sent: ${tx.hash}`);
         
         const receipt = await tx.wait();
@@ -358,11 +360,11 @@ Environment Variables:
                 break;
                 
             case "addLiquidity":
-                if (args.length !== 6) {
-                    console.error("Usage: addLiquidity <contract> <token0> <token1> <amount0> <amount1>");
+                if (args.length !== 8) {
+                    console.error("Usage: addLiquidity <contract> <token0> <token1> <amount0> <amount1> <amount0Min> <amount1Min>");
                     process.exit(1);
                 }
-                await addLiquidity(args[1], args[2], args[3], args[4], args[5], signer);
+                await addLiquidity(args[1], args[2], args[3], args[4], args[5], args[6], args[7], signer);
                 break;
                 
             default:

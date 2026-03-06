@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useMemo } from "react";
 import { motion } from "framer-motion";
 import { Header } from "@/components/Header";
 import { TradingViewChart } from "@/components/TradingViewChart";
@@ -10,19 +10,39 @@ import { MarketList } from "@/components/Trading/MarketList";
 import { PositionTable, type PositionTableTab, type PositionRow, type OrderRow } from "@/components/Trading/PositionTable";
 import { OrderForm } from "@/components/Trading/OrderForm";
 import { useAccount } from "wagmi";
+import { useReadContracts } from "wagmi";
 import { useBinanceData } from "@/hooks/useBinanceData";
+import { useOpenPositions, usePositionActions } from "@/hooks/usePositions";
+import { OAK_CONTRACT_ADDRESS, oakOrderAbi } from "@/lib/oakContract";
 import {
   useTradeStore,
   getDisplayBalance,
 } from "@/store/useTradeStore";
 import { secureSaltHex, scrubSecret, isRevealWindowValid } from "@/lib/security";
 
-const PLACEHOLDER_POSITIONS: PositionRow[] = [];
+const ZERO = "0x0000000000000000000000000000000000000000";
+const CONTRACT = OAK_CONTRACT_ADDRESS as `0x${string}`;
+
 const PLACEHOLDER_ORDERS: OrderRow[] = [
   { id: "0x1a2b", type: "Limit Buy", pair: "ETH/USDC", amount: "0.5 ETH", status: "Filled" },
   { id: "0x3c4d", type: "Market Sell", pair: "ETH/USDC", amount: "0.25 ETH", status: "Filled" },
   { id: "0x5e6f", type: "Limit Sell", pair: "ETH/USDC", amount: "1.0 ETH", status: "Open" },
 ];
+
+/** Format 18-decimal bigint as short price string. */
+function formatPriceFromRaw(raw: bigint): string {
+  const n = Number(raw) / 1e18;
+  if (n >= 1000) return n.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  if (n >= 1) return n.toFixed(2);
+  return n.toFixed(4);
+}
+
+/** Format size (18 decimals) for display. */
+function formatSize(raw: bigint): string {
+  const n = Number(raw) / 1e18;
+  if (n >= 1) return n.toFixed(4);
+  return n.toFixed(6);
+}
 
 const REVEAL_MAX_BLOCKS = 20;
 
@@ -72,6 +92,68 @@ export default function TradingPage() {
   const transactions = useTradeStore((s) => s.transactions);
   const applySwap = useTradeStore((s) => s.applySwap);
   const addTransaction = useTradeStore((s) => s.addTransaction);
+
+  const { positions: openPositions, isLoading: positionsLoading, refetch: refetchPositions } = useOpenPositions();
+  const { closePosition, isPending: closePending } = usePositionActions();
+  const [closingId, setClosingId] = useState<bigint | null>(null);
+
+  const priceContracts = useMemo(
+    () =>
+      openPositions.map((p) => ({
+        address: CONTRACT,
+        abi: oakOrderAbi,
+        functionName: "get_current_price" as const,
+        args: [p.baseToken, p.quoteToken] as const,
+      })),
+    [openPositions]
+  );
+  const { data: priceResults } = useReadContracts({
+    contracts: OAK_CONTRACT_ADDRESS !== ZERO && openPositions.length > 0 ? priceContracts : [],
+  });
+
+  const positionRows: PositionRow[] = useMemo(() => {
+    return openPositions.map((p, i) => {
+      const priceRes = priceResults?.[i];
+      const currentPriceRaw =
+        priceRes?.status === "success" && priceRes.result !== undefined
+          ? (priceRes.result as bigint)
+          : null;
+      const entryNum = Number(p.entryPrice) / 1e18;
+      const currentNum = currentPriceRaw != null ? Number(currentPriceRaw) / 1e18 : null;
+      const sizeNum = Number(p.size) / 1e18;
+      const pnlQuote = currentNum != null ? sizeNum * (currentNum - entryNum) : null;
+      const pnlPct = currentNum != null && entryNum > 0 ? ((currentNum - entryNum) / entryNum) * 100 : null;
+      const pairLabel = "Base/Quote";
+      return {
+        symbol: pairLabel,
+        side: "Long",
+        size: formatSize(p.size),
+        entry: formatPriceFromRaw(p.entryPrice),
+        current: currentPriceRaw != null ? formatPriceFromRaw(currentPriceRaw) : undefined,
+        tp: p.tpPrice > 0n ? formatPriceFromRaw(p.tpPrice) : undefined,
+        sl: p.slPrice > 0n ? formatPriceFromRaw(p.slPrice) : undefined,
+        pnl:
+          pnlPct != null
+            ? `${pnlQuote != null && pnlQuote >= 0 ? "+" : ""}${pnlQuote?.toFixed(2) ?? "0"} (${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%)`
+            : "—",
+        positionId: p.positionId,
+        onClose: () => {
+          setClosingId(p.positionId);
+          const minOut =
+            currentPriceRaw != null
+              ? (p.size * currentPriceRaw * 995n) / (1000n * BigInt(1e18))
+              : 0n;
+          closePosition(p.positionId, minOut.toString())
+            .then(() => {
+              setClosingId(null);
+              refetchPositions();
+            })
+            .catch(() => setClosingId(null));
+        },
+        closing: closePending && closingId === p.positionId,
+      };
+    });
+  }, [openPositions, priceResults, closePosition, closePending, closingId, refetchPositions]);
 
   const [selectedPair, setSelectedPair] = useState("ETH/USDC");
   const [bottomTab, setBottomTab] = useState<PositionTableTab>("trades");
@@ -235,9 +317,12 @@ export default function TradingPage() {
               <PositionTable
                 activeTab={bottomTab}
                 onTabChange={setBottomTab}
-                positions={PLACEHOLDER_POSITIONS}
+                positions={positionRows}
                 orders={PLACEHOLDER_ORDERS}
                 trades={transactions}
+                positionsLoading={positionsLoading}
+                chartSymbol={selectedPair}
+                chartSymbolDefault="ETH/USDC"
                 className="h-full min-h-[160px]"
               />
             </div>

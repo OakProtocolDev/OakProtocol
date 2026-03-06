@@ -27,6 +27,8 @@
 | 🛡️ **MEV-Protection UI** | Swap widget ready for commit-reveal; slippage settings, deadline protection, and clear error states |
 | ⚡ **Stylus Backend** | Core logic in Rust on Arbitrum Stylus — maximum gas efficiency and security |
 
+**Grant-ready:** We maintain application materials for **$20k+** ecosystem grants (Arbitrum Foundation, Stylus, DeFi). See **[grants/](grants/)** for one-pager, full application draft, and checklist.
+
 ---
 
 ## 📦 Tech Stack
@@ -86,6 +88,27 @@ cargo stylus deploy --wasm-file target/wasm32-unknown-unknown/release/oak_protoc
 |-------|--------|------------|
 | **Phase 1: MVP** | ✅ **Done** | Rust/Stylus core, commit-reveal, flash swaps, GMX-style dashboard, real-time charts, Wagmi + RainbowKit |
 | **Phase 2: Mainnet** | 🔜 **Soon** | External audit, multisig treasury, Arbitrum One deployment, liquidity bootstrapping |
+
+---
+
+## 🧱 Protocol Status: What’s Implemented vs What’s Next
+
+- **On-chain core already implemented**
+  - **Trading**: CPMM multi-pool AMM, commit–reveal swaps, multi-hop routing, flash swaps with \(k' \ge k(1+fee)\), per-token fee accounting (60/20/20).
+  - **Risk / Pro terminal**: tracked positions with entry price and collateral, TP/SL, trailing stop, health view, bank-style trade size caps, circuit breaker by price impact.
+  - **Social / Orders**: on-chain limit / TP / SL orders with OCO links, keeper-friendly execution when ценовые условия выполняются.
+  - **Security / Governance**: global reentrancy guard, emergency `paused` flag (Pausable), role-based AccessControl (DEFAULT_ADMIN_ROLE, PAUSER_ROLE, UPGRADER_ROLE, TIMELOCK_ADMIN_ROLE), Timelock skeleton (queue → delay → execute), rich error codes.
+  - **Infra**: analytics views (volume, reserves, trade impact), per-token treasury/buyback balances, EIP‑712 gasless `execute_swap_with_permit`, GMX-style vault scaffold (`OakSentinel`) для будущего perps/GMX-модуля.
+
+- **To deliver for a production-ready public DEX**
+  - **Entry/ABI finalization**: сгенерировать и зафиксировать полный `#[public]` интерфейс Stylus (все user-facing функции в ABI), собрать и протестировать финальный WASM.
+  - **LP UX**: либо формализовать внутренний LP-учёт (и UI вокруг него), либо добавить стандартный ERC‑20 LP токен-контракт и синхронизировать mint/burn с `add_liquidity` / `remove_liquidity`.
+  - **Token listing**: ввести whitelist токенов и политику по нестандартным токенам (fee-on-transfer, rebase), добавить тесты и документацию.
+  - **Vault / perps**: либо довести `vault.rs`/`OakSentinel` до прод-логики (ликвидации, орклы, риск-параметры), либо закрыть публичный доступ к этому модулю до отдельного релиза.
+  - **Governance plumbing**: развернуть multisig, выдать роли (ADMIN/PAUSER/TIMELOCK), подключить Timelock к изменению критичных параметров (fee, caps, whitelist, treasury).
+  - **Off-chain services**: keeper-боты для TP/SL и trailing, relayer для gasless-потока (EIP‑712), indexer/Subgraph для пар, ордеров, позиций и timelock-операций.
+  - **Frontend wiring**: довести дашборд до полного покрытия новых entrypoints (позиции, ордера, gasless, timelock-админка), учесть состояние `paused`/circuit breaker.
+  - **Audit & testing**: внешний аудит, fuzzing (Foundry/Forge или аналог) для инвариантов пула, позиций и flash swaps, нагрузочные тесты перед mainnet.
 
 ---
 
@@ -214,32 +237,51 @@ Oak Protocol implements **defense-in-depth** security patterns:
 - ✅ **High-Risk Vulnerabilities**: 0
 - 🔄 **External Audit**: Planned (Q2 2026)
 
-### 💰 Sustainable Treasury Model
+### 💰 Sustainable Treasury Model (60/20/20)
 
-Oak Protocol implements a **transparent, sustainable fee model**:
+Oak Protocol implements a **transparent, world-class fee model**:
 
-| Component | Fee | Allocation | Purpose |
-|-----------|-----|-----------|---------|
-| **Total Fee** | 0.3% | Per swap | Protocol revenue |
-| **Treasury Share** | 0.12% | 40% of total | Protocol development, grants, team |
-| **LP Share** | 0.18% | 60% of total | Liquidity provider rewards |
+| Component | Share | Purpose |
+|-----------|-------|---------|
+| **LP** | 60% of fee | Stays in pool; rewards LPs |
+| **Treasury** | 20% of fee | Protocol/grants (claimable per token) |
+| **Buyback** | 20% of fee | OAK buyback fund (per-token balance) |
 
-**Fee Distribution Flow:**
+**Fee flow:** Total fee (e.g. 0.5%) → 60% LP (in pool), 20% `treasury_balance[token]`, 20% `buyback_balance[token]`. Owner claims via `withdraw_treasury_fees(token)`.
 
-```
-Swap Amount: 1000 tokens
-├─ Total Fee (0.3%): 3 tokens
-│  ├─ Treasury (0.12%): 1.2 tokens → accrued_treasury_fees_token0
-│  └─ LP (0.18%): 1.8 tokens → accrued_lp_fees_token0
-└─ Effective Swap: 997 tokens (CPMM calculation)
-```
+### 🌍 World-Class Views & Safety
 
-**Treasury Withdrawal:**
-- **Access**: Owner-only (intended for multisig)
-- **Frequency**: On-demand (no time locks)
-- **Transparency**: All withdrawals emit `WithdrawTreasuryFees` events
+| Feature | Description |
+|---------|-------------|
+| **`get_protocol_analytics()`** | Total trading volume for dashboards and grant transparency. |
+| **`get_treasury_balance(token)`** / **`get_buyback_balance(token)`** | Per-token balances. |
+| **`calculate_trade_impact(amount_in, path)`** | Returns `(amounts_out, price_impact_bps_per_hop, fee_per_hop)` — CEX-grade for UI. |
+| **`get_lp_position(user, token_a, token_b)`** | LP balance and pool share in bps. |
+| **`get_dynamic_fee_bps(...)`** | Fee hook (base fee now; extensible to volatility-based). |
+| **Circuit breaker** | Auto-triggers when price impact &gt; 20%; owner can trigger/clear. When on: only remove_liquidity and claim_fees allowed. |
 
-> 💡 **Future**: Treasury address can be upgraded to a DAO multisig for decentralized governance.
+### 🏦 Bank & DoD-Grade Security Additions
+
+| Control | Description |
+|--------|-------------|
+| **Max path length** | `MAX_PATH_LENGTH = 10` to prevent DoS and gas griefing on multi-hop. |
+| **Max single-trade size** | Single trade cannot exceed `MAX_TRADE_RESERVE_BPS` (e.g. 10%) of reserve — bank-style cap. |
+| **LP slippage** | `add_liquidity(..., amount0_min, amount1_min)` and `remove_liquidity(..., amount0_min, amount1_min)` — never accept below user minimum. |
+| **Two-step ownership** | `set_pending_owner(addr)` then `accept_owner()` after `OWNER_TRANSFER_DELAY_BLOCKS` (e.g. ~24h). |
+| **Audit events** | `CircuitBreakerTriggered(impact_bps)`, `CircuitBreakerCleared`, `PoolCreated`, `PendingOwnerSet`, `OwnerChanged`, `BuybackWalletSet`. |
+| **Buyback wallet** | Owner-only `set_buyback_wallet(addr)` for 20% fee destination. |
+| **get_amount_in / get_amounts_in** | Inverse quote (round up) for "You receive X → You pay". |
+| **get_quote** | Wrapper over `calculate_trade_impact` for UI. |
+| **get_impermanent_loss_bps** | Pool-level IL estimate in bps for LP UI. |
+
+### 📈 Pro Trading Terminal (Limit Orders, TP/SL, Positions)
+
+| Feature | Description |
+|--------|--------------|
+| **Limit / TP / SL orders** | `place_order(token_in, token_out, amount_out, trigger_price, order_type)` — tokens escrowed on-chain; anyone can `execute_order` when price condition is met. Order types: 0 = Limit, 1 = TP, 2 = SL. |
+| **Tracked positions** | `open_position(base, quote, size, entry_price)` records a position for PnL and TP/SL. Tokens stay in user wallet. `set_position_tp_sl(position_id, tp_price, sl_price)`; `close_position(position_id, min_out)` market-sells base for quote. |
+| **Keeper-friendly TP/SL** | `execute_position_tp_sl(position_id, min_out)` — anyone can call when current price ≥ TP or ≤ SL; closes position and sends quote to owner. |
+| **Dashboard** | Positions tab shows Entry, Current, TP, SL, PnL and a **Close** button; orders tab for Limit/TP/SL history. See [docs/ORDER_POSITION_ARCHITECTURE.md](docs/ORDER_POSITION_ARCHITECTURE.md) for on-chain vs off-chain design and gas notes. |
 
 ---
 
@@ -590,7 +632,7 @@ We conducted a **comprehensive internal security audit** covering:
 - **Medium-Risk Findings**: 2 (Operational recommendations)
 - **Low-Risk Findings**: 3 (Enhancement suggestions)
 
-**Full Report**: See [`SECURITY_REVIEW.md`](./SECURITY_REVIEW.md) for detailed analysis.
+**Full Report**: See **[SECURITY_AUDIT.md](./SECURITY_AUDIT.md)** for threat model, attack vectors, mitigations, and pre-mainnet checklist. For responsible disclosure see [SECURITY.md](./SECURITY.md).
 
 ### External Audit Plan
 

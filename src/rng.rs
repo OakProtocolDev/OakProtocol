@@ -46,7 +46,7 @@ impl OakRng {
         input[64..96].copy_from_slice(&<FixedBytes<32> as Into<[u8; 32]>>::into(seed));
 
         // keccak256(input)
-        let hash = crypto::keccak(&input);
+        let hash = crypto::keccak(input);
 
         // Интерпретируем hash как U256 (big‑endian).
         U256::from_be_bytes::<32>(hash.into())
