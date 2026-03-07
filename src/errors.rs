@@ -106,6 +106,14 @@ pub const ERR_POSITION_TP_SL_NOT_MET: &[u8] = b"POSITION_TP_SL_NOT_MET";
 pub const ERR_TRAILING_DISABLED: &[u8] = b"TRAILING_DISABLED";
 /// Trailing stop condition not met (price above trigger level).
 pub const ERR_TRAILING_NOT_TRIGGERED: &[u8] = b"TRAILING_NOT_TRIGGERED";
+
+// Batch execution (Shared Execution Gas-Rebate)
+/// Batch must contain at least 2 positions.
+pub const ERR_BATCH_TOO_FEW: &[u8] = b"BATCH_TOO_FEW";
+/// Batch exceeds MAX_BATCH_POSITIONS.
+pub const ERR_BATCH_TOO_MANY: &[u8] = b"BATCH_TOO_MANY";
+/// All positions in batch must share the same (base, quote) pair.
+pub const ERR_BATCH_NOT_SAME_PAIR: &[u8] = b"BATCH_NOT_SAME_PAIR";
 /// Invalid OCO pair (order not found or not open).
 pub const ERR_OCO_PAIR_INVALID: &[u8] = b"OCO_PAIR_INVALID";
 /// Margin: zero amount or insufficient balance.
@@ -124,6 +132,23 @@ pub const ERR_TIMELOCK_UNKNOWN_OPERATION: &[u8] = b"TIMELOCK_UNKNOWN_OPERATION";
 pub const ERR_TIMELOCK_NOT_READY: &[u8] = b"TIMELOCK_NOT_READY";
 /// Operation already executed or cancelled.
 pub const ERR_TIMELOCK_ALREADY_EXECUTED: &[u8] = b"TIMELOCK_ALREADY_EXECUTED";
+
+// Growth Engine
+pub const ERR_REFERRAL_SELF: &[u8] = b"REFERRAL_SELF";
+pub const ERR_REFERRAL_FEE_TOO_HIGH: &[u8] = b"REFERRAL_FEE_TOO_HIGH";
+pub const ERR_STAKING_NOT_INIT: &[u8] = b"STAKING_NOT_INIT";
+pub const ERR_STAKING_ZERO_AMOUNT: &[u8] = b"STAKING_ZERO_AMOUNT";
+pub const ERR_QUEST_ALREADY_CLAIMED: &[u8] = b"QUEST_ALREADY_CLAIMED";
+pub const ERR_QUEST_MILESTONE_NOT_MET: &[u8] = b"QUEST_MILESTONE_NOT_MET";
+
+// Intelligence Layer: Copy Trading
+pub const ERR_COPY_NOT_SUBSCRIBED: &[u8] = b"COPY_NOT_SUBSCRIBED";
+pub const ERR_COPY_LEADER_MISMATCH: &[u8] = b"COPY_LEADER_MISMATCH";
+pub const ERR_COPY_SLIPPAGE: &[u8] = b"COPY_SLIPPAGE";
+// Signal Marketplace
+pub const ERR_SIGNAL_NOT_LISTED: &[u8] = b"SIGNAL_NOT_LISTED";
+pub const ERR_SIGNAL_ALREADY_PURCHASED: &[u8] = b"SIGNAL_ALREADY_PURCHASED";
+pub const ERR_SIGNAL_INVALID_SIGNATURE: &[u8] = b"SIGNAL_INVALID_SIGNATURE";
 
 // Gasless / EIP-712 permit swap
 /// Invalid EIP-712 signature or recovered signer mismatch.

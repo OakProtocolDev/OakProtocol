@@ -1,7 +1,7 @@
-//! Oak Protocol - Next-generation DEX for Arbitrum Stylus
+//! Oak Stylus Trading Engine - Native Stylus terminal for Arbitrum
 //!
-//! This DEX implements a Commit-Reveal system to protect users from
-//! front-running and sandwich attacks (MEV protection).
+//! Atomic swaps by default (EVM-style); optional commit-reveal for MEV protection.
+//! Institutional order types: limit orders, TP/SL, trailing stops.
 //!
 //! The crate is `no_std` on-chain, but uses `std` for tests.
 
@@ -26,7 +26,13 @@ pub mod state;
 pub mod pausable;
 /// TimelockController: queue -> delay -> execute.
 pub mod timelock;
-/// Core business logic (CPMM, commit‑reveal, admin).
+/// Core Engine: swap core, execution strategy (Atomic / Commit-Reveal), order execution.
+pub mod engine;
+/// Growth Engine: StakingRewards, Referral, Quest (EmissionEvent for indexer).
+pub mod growth;
+/// Intelligence Layer: Copy Trading, Signal Marketplace (EIP-712).
+pub mod intelligence;
+/// Core business logic (CPMM, atomic swap, optional commit‑reveal, admin).
 pub mod logic;
 /// ERC-20 token interface and transfer utilities.
 pub mod token;

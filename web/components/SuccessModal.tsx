@@ -15,6 +15,8 @@ export interface SuccessModalProps {
   token1Symbol?: string;
   /** When true, show DEMO badge and treat tx as simulated (realistic fake Arbiscan link). */
   isDemo?: boolean;
+  /** When true, message says MEV-protected (commit-reveal); otherwise atomic swap. */
+  useCommitReveal?: boolean;
   onClose: () => void;
 }
 
@@ -46,6 +48,7 @@ export function SuccessModal({
   token0Symbol = "ETH",
   token1Symbol = "USDC",
   isDemo = false,
+  useCommitReveal = false,
   onClose,
 }: SuccessModalProps) {
   const hasFiredConfetti = useRef(false);
@@ -140,7 +143,9 @@ export function SuccessModal({
                 <p className="mt-1 text-center text-sm text-oak-text-secondary">
                   {isDemo
                     ? "Simulated swap completed (Demo Mode)"
-                    : "Your swap was MEV-protected via commit-reveal"}
+                    : useCommitReveal
+                      ? "Your swap was MEV-protected via commit-reveal"
+                      : "Swap completed (atomic execution)"}
                 </p>
 
                 <div className="mt-5 rounded-oak border border-oak-border bg-oak-bg-elevated p-4">

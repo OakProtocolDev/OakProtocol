@@ -124,6 +124,28 @@ pub fn emit_circuit_breaker_cleared() {
     let _ = evm::raw_log(topics, data);
 }
 
+/// EmergencyTriggered(reason indexed). For The Graph: TWAP deviation, manual pause, etc.
+pub fn emit_emergency_triggered(reason: FixedBytes<32>) {
+    let topics: &[FixedBytes<32>] = &[reason];
+    let data: &[u8] = &[];
+    let _ = evm::raw_log(topics, data);
+}
+
+/// SwapExecuted(sender indexed, tokenIn indexed, tokenOut indexed, amountIn, amountOut). For The Graph.
+pub fn emit_swap_executed(
+    sender: Address,
+    token_in: Address,
+    token_out: Address,
+    amount_in: U256,
+    amount_out: U256,
+) {
+    let topics = &[sender.into_word(), token_in.into_word(), token_out.into_word()];
+    let mut data = Vec::new();
+    data.extend_from_slice(&amount_in.to_be_bytes::<32>());
+    data.extend_from_slice(&amount_out.to_be_bytes::<32>());
+    let _ = evm::raw_log(topics, &data);
+}
+
 /// Emit when a new pool is created. Indexers use this to enumerate pairs.
 pub fn emit_pool_created(token0: Address, token1: Address) {
     let topics = &[token0.into_word(), token1.into_word()];
@@ -192,8 +214,9 @@ pub fn emit_order_executed(order_id: U256, owner: Address, amount_in_received: U
 }
 
 // ---------- Position events (pro terminal) ----------
+// PositionOpened(positionId, owner indexed, baseToken indexed, quoteToken indexed, size, entryPrice) — use emit_open_position below for The Graph.
 
-/// Emit when a position is opened (tracked for PnL/TP/SL).
+/// PositionOpened: position_id, owner indexed, base_token indexed, quote_token indexed, size, entry_price. For The Graph.
 pub fn emit_open_position(
     position_id: U256,
     owner: Address,
@@ -247,6 +270,81 @@ pub fn emit_trailing_stop_triggered(position_id: U256, owner: Address, peak_pric
     data.extend_from_slice(&peak_price.to_be_bytes::<32>());
     data.extend_from_slice(&trigger_price.to_be_bytes::<32>());
     data.extend_from_slice(&amount_out.to_be_bytes::<32>());
+    let _ = evm::raw_log(topics, &data);
+}
+
+/// Emit when a batch of positions is executed (Shared Execution Gas-Rebate).
+/// executor: caller; total_size: aggregated base sold; total_quote_out: aggregated quote received; rebate_bps: fee discount applied.
+pub fn emit_batch_positions_executed(executor: Address, total_size: U256, total_quote_out: U256, rebate_bps: U256, position_count: U256) {
+    let topics = &[executor.into_word()];
+    let mut data = Vec::new();
+    data.extend_from_slice(&total_size.to_be_bytes::<32>());
+    data.extend_from_slice(&total_quote_out.to_be_bytes::<32>());
+    data.extend_from_slice(&rebate_bps.to_be_bytes::<32>());
+    data.extend_from_slice(&position_count.to_be_bytes::<32>());
+    let _ = evm::raw_log(topics, &data);
+}
+
+// -----------------------------------------------------------------------------
+// Growth Engine: EmissionEvent for indexer (personal cabinet)
+// -----------------------------------------------------------------------------
+/// Module IDs for EmissionEvent (data).
+pub fn emission_module_staking() -> U256 { U256::from(1u64) }
+pub fn emission_module_referral() -> U256 { U256::from(2u64) }
+pub fn emission_module_quest() -> U256 { U256::from(3u64) }
+
+/// EmissionEvent(module_id, user, event_type, amount, token_id).
+/// Indexer listens for this event to display Staking/Referral/Quest in personal cabinet.
+/// event_type: 0 = RewardClaimed, 1 = Staked, 2 = Unstaked, 3 = ReferralFee, 4 = XPGranted, 5 = BadgeMinted.
+pub fn emit_emission_event(
+    module_id: U256,
+    user: Address,
+    event_type: U256,
+    amount: U256,
+    token_id: U256,
+) {
+    let topics = &[user.into_word()];
+    let mut data = Vec::new();
+    data.extend_from_slice(&module_id.to_be_bytes::<32>());
+    data.extend_from_slice(&event_type.to_be_bytes::<32>());
+    data.extend_from_slice(&amount.to_be_bytes::<32>());
+    data.extend_from_slice(&token_id.to_be_bytes::<32>());
+    let _ = evm::raw_log(topics, &data);
+}
+
+// -----------------------------------------------------------------------------
+// Intelligence Layer: Copy Trading & Signal Marketplace (for indexer / alerts)
+// -----------------------------------------------------------------------------
+/// Copy subscription created: follower, leader, slippage_bps, amount_ratio_bps.
+pub fn emit_copy_subscription(follower: Address, leader: Address, slippage_bps: U256, amount_ratio_bps: U256) {
+    let topics = &[follower.into_word(), leader.into_word()];
+    let mut data = Vec::new();
+    data.extend_from_slice(&slippage_bps.to_be_bytes::<32>());
+    data.extend_from_slice(&amount_ratio_bps.to_be_bytes::<32>());
+    let _ = evm::raw_log(topics, &data);
+}
+
+/// Copy subscription revoked by follower (any time).
+pub fn emit_copy_subscription_revoked(follower: Address, leader: Address) {
+    let topics = &[follower.into_word(), leader.into_word()];
+    let _ = evm::raw_log(topics, &[]);
+}
+
+/// Copy trade executed for follower (backend uses for push notifications).
+pub fn emit_copy_trade_executed(follower: Address, leader: Address, amount_in: U256, amount_out: U256) {
+    let topics = &[follower.into_word(), leader.into_word()];
+    let mut data = Vec::new();
+    data.extend_from_slice(&amount_in.to_be_bytes::<32>());
+    data.extend_from_slice(&amount_out.to_be_bytes::<32>());
+    let _ = evm::raw_log(topics, &data);
+}
+
+/// Signal purchased: buyer, seller, listing_hash, price. Backend delivers encrypted content key.
+pub fn emit_signal_purchased(buyer: Address, seller: Address, listing_hash: U256, price: U256) {
+    let topics = &[buyer.into_word(), seller.into_word()];
+    let mut data = Vec::new();
+    data.extend_from_slice(&listing_hash.to_be_bytes::<32>());
+    data.extend_from_slice(&price.to_be_bytes::<32>());
     let _ = evm::raw_log(topics, &data);
 }
 

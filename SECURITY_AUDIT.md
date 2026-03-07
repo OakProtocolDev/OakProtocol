@@ -95,6 +95,7 @@
 |--------|------------|--------|
 | Flash loan to drain pool | Single-trade cap: `amount_in <= reserve_in * MAX_TRADE_RESERVE_BPS / BPS` (e.g. 10%). | ✅ |
 | Extreme price impact | Circuit breaker auto-triggers when price impact >= 20%; swaps disabled until owner clears. | ✅ |
+| TWAP deviation per block | If TWAP price changes >15% in one block, contract is paused and circuit breaker triggered (`src/engine/emergency.rs` `check_price_deviation`); `EmergencyTriggered(reason)` emitted. | ✅ |
 | Flash swap repay < k | Flash swap enforces `k' >= k * (1 + fee)` after callback. | ✅ |
 
 **Checklist:** Trade size cap; circuit breaker; flash swap k check.
@@ -156,9 +157,10 @@
 - **remove_liquidity:** `amount0_min`, `amount1_min` enforce slippage protection for LP withdrawal.
 - **Path length:** All path-based functions enforce `path.len() <= MAX_PATH_LENGTH`.
 - **Single-trade cap:** `amount_in <= reserve_in * MAX_TRADE_RESERVE_BPS / BPS`.
-- **Circuit breaker:** Auto-trigger on impact >= 20%; manual trigger/clear with events.
+- **Circuit breaker:** Auto-trigger on impact >= 20%; TWAP deviation >15% per block triggers pause + circuit breaker + EmergencyTriggered; manual trigger/clear with events.
 - **Two-step ownership:** Pending owner + delay; events for audit trail.
-- **Events:** CircuitBreakerTriggered/Cleared, PoolCreated, PendingOwnerSet, OwnerChanged, BuybackWalletSet, WithdrawTreasuryFees.
+- **Timelock:** Critical admin (set_fee, withdraw_treasury_fees, set_buyback_wallet) should use TimelockController (24h delay); see `docs/SECURITY_AUDIT.md`.
+- **Events:** CircuitBreakerTriggered/Cleared, EmergencyTriggered, SwapExecuted, PositionOpened (emit_open_position), PoolCreated, PendingOwnerSet, OwnerChanged, BuybackWalletSet, WithdrawTreasuryFees.
 
 ---
 

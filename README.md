@@ -1,30 +1,30 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Arbitrum-Stylus-28A0F0?style=for-the-badge&logo=ethereum" alt="Arbitrum Stylus" />
   <img src="https://img.shields.io/badge/Rust-Secure-000000?style=for-the-badge&logo=rust" alt="Rust" />
-  <img src="https://img.shields.io/badge/MEV-Protected-00C853?style=for-the-badge" alt="MEV Protected" />
+  <img src="https://img.shields.io/badge/Stylus-Trading%20Engine-28A0F0?style=for-the-badge" alt="Stylus Trading Engine" />
   <img src="https://img.shields.io/badge/Audit-Ready-FF6D00?style=for-the-badge" alt="Audit Ready" />
 </p>
 
-<h1 align="center">🌳 Oak Protocol</h1>
+<h1 align="center">🌳 Oak Stylus Trading Engine</h1>
 <p align="center">
-  <strong>The Next-Gen, MEV-Protected DEX on Arbitrum Stylus.</strong>
+  <strong>The first native Stylus terminal with institutional order types on Arbitrum.</strong>
 </p>
 <p align="center">
-  <em>Fair DeFi. Zero Front-Running. Built for the Future.</em>
+  <em>Limit orders. TP/SL. Trailing stops. Atomic execution. Built in Rust.</em>
 </p>
 
 ---
 
 ## 🚀 What's New
 
-**Oak Protocol now ships a production-ready DeFi dashboard** — a GMX-inspired, dark-themed trading interface with real-time charts, seamless wallet connection, and a UI built for our commit-reveal MEV protection flow.
+**Oak Stylus Trading Engine** ships a production-ready DeFi dashboard — a GMX-inspired, dark-themed trading interface with real-time charts, seamless wallet connection, and atomic swaps by default (optional commit-reveal for MEV protection).
 
 | Feature | Description |
 |---------|-------------|
 | 📊 **GMX-Inspired Dashboard** | 3-column professional layout (Chart \| Swap \| Pool) — elite on 2K monitors, stacks perfectly on mobile |
 | 📈 **Real-Time Charts** | Lightweight-Charts integration for high-performance price visualization with our oak dark theme |
 | 🔗 **Modern Web3 Stack** | Next.js 14 (App Router), Tailwind CSS, Wagmi v2, RainbowKit — MetaMask, WalletConnect, and more |
-| 🛡️ **MEV-Protection UI** | Swap widget ready for commit-reveal; slippage settings, deadline protection, and clear error states |
+| 🛡️ **Execution UI** | Atomic swap by default; optional commit-reveal; slippage and deadline protection; expected price before submit |
 | ⚡ **Stylus Backend** | Core logic in Rust on Arbitrum Stylus — maximum gas efficiency and security |
 
 **Grant-ready:** We maintain application materials for **$20k+** ecosystem grants (Arbitrum Foundation, Stylus, DeFi). See **[grants/](grants/)** for one-pager, full application draft, and checklist.
@@ -48,7 +48,7 @@
 | Pillar | Benefit |
 |--------|---------|
 | **⚡ Efficiency** | 40–50% gas savings vs. Solidity DEXs; WASM-optimized execution |
-| **🔒 Security** | Cryptographic commit-reveal, 100% checked arithmetic, reentrancy guards, owner-only controls |
+| **🔒 Security** | Slippage + deadline protection, 100% checked arithmetic, reentrancy guards, AccessControl + Timelock for admin |
 | **🎨 Pro UI** | GMX/Aave-inspired dark theme, responsive layout, loading states, and polished UX |
 
 ---
@@ -86,7 +86,7 @@ cargo stylus deploy --wasm-file target/wasm32-unknown-unknown/release/oak_protoc
 
 | Phase | Status | Highlights |
 |-------|--------|------------|
-| **Phase 1: MVP** | ✅ **Done** | Rust/Stylus core, commit-reveal, flash swaps, GMX-style dashboard, real-time charts, Wagmi + RainbowKit |
+| **Phase 1: MVP** | ✅ **Done** | Rust/Stylus core, atomic swaps + optional commit-reveal, flash swaps, GMX-style dashboard, Limit/TP/SL/Trailing, Wagmi + RainbowKit |
 | **Phase 2: Mainnet** | 🔜 **Soon** | External audit, multisig treasury, Arbitrum One deployment, liquidity bootstrapping |
 
 ---
@@ -94,7 +94,7 @@ cargo stylus deploy --wasm-file target/wasm32-unknown-unknown/release/oak_protoc
 ## 🧱 Protocol Status: What’s Implemented vs What’s Next
 
 - **On-chain core already implemented**
-  - **Trading**: CPMM multi-pool AMM, commit–reveal swaps, multi-hop routing, flash swaps with \(k' \ge k(1+fee)\), per-token fee accounting (60/20/20).
+  - **Trading**: CPMM multi-pool AMM, **atomic swaps by default** (optional commit–reveal), multi-hop routing, flash swaps with \(k' \ge k(1+fee)\), per-token fee accounting (60/20/20).
   - **Risk / Pro terminal**: tracked positions with entry price and collateral, TP/SL, trailing stop, health view, bank-style trade size caps, circuit breaker by price impact.
   - **Social / Orders**: on-chain limit / TP / SL orders with OCO links, keeper-friendly execution when ценовые условия выполняются.
   - **Security / Governance**: global reentrancy guard, emergency `paused` flag (Pausable), role-based AccessControl (DEFAULT_ADMIN_ROLE, PAUSER_ROLE, UPGRADER_ROLE, TIMELOCK_ADMIN_ROLE), Timelock skeleton (queue → delay → execute), rich error codes.
@@ -114,27 +114,14 @@ cargo stylus deploy --wasm-file target/wasm32-unknown-unknown/release/oak_protoc
 
 ## 🎯 Project Vision
 
-**Oak Protocol** is not just another DEX—it's a fundamental reimagining of decentralized exchange architecture, designed to eliminate MEV extraction and restore fairness to DeFi trading.
+**Oak Stylus Trading Engine** is the first native Stylus terminal with **institutional order types** on Arbitrum: limit orders, TP/SL, and trailing stops, with atomic execution by default and optional commit-reveal for MEV-sensitive flows.
 
-### The Problem We're Solving
+### What We Deliver
 
-The current DeFi landscape is fundamentally broken. MEV (Maximum Extractable Value) bots extract **billions of dollars annually** from retail traders through front-running and sandwich attacks. Traditional DEXs expose swap parameters in the mempool, allowing sophisticated actors to:
-
-- **Front-run** profitable trades by submitting higher gas transactions
-- **Sandwich** users by manipulating prices before and after their swaps
-- **Extract value** that rightfully belongs to traders and liquidity providers
-
-This creates an **uneven playing field** where retail traders consistently lose value to sophisticated MEV extractors.
-
-### Our Solution: Cryptographic MEV Resistance
-
-Oak Protocol introduces a **stateful commit-reveal mechanism** that cryptographically hides swap parameters until execution. By combining:
-
-- **Cryptographic commitments** (keccak256 hashing) to hide swap intent
-- **Time-locked reveals** (5-block delay) to prevent immediate front-running
-- **Rust/WASM efficiency** (40-50% gas savings) to make MEV protection affordable
-
-We've created the first production-ready DEX that **mathematically prevents** MEV extraction while maintaining the efficiency and composability that DeFi demands.
+- **Atomic execution (EVM-style)** — Default swap path is one transaction with slippage and deadline protection; no multi-block delay.
+- **Institutional order types** — Limit orders, Take-Profit/Stop-Loss, and trailing stops, gas-optimized in Rust/Stylus.
+- **Optional commit-reveal** — For users who want MEV protection, the protocol supports an opt-in commit → delay → reveal flow.
+- **Rust/WASM efficiency** — 40–50% gas savings vs. Solidity; execution quality and cost matter for pro traders.
 
 ### Why Arbitrum Stylus?
 
@@ -145,36 +132,23 @@ Arbitrum Stylus enables us to build with **Rust**, providing:
 - **Type safety** at compile time, reducing runtime errors
 - **Modern tooling** for faster development and easier auditing
 
-Oak Protocol showcases the power of Stylus to build **next-generation DeFi primitives** that are both more secure and more efficient than traditional EVM implementations.
+Oak showcases Stylus for **production DeFi**: institutional order types and execution quality on Arbitrum.
 
 ---
 
 ## ✨ Core Features
 
-### 🔐 MEV-Resistance via Stateful Commit-Reveal
+### 🔐 Execution: Atomic (default) + Optional Commit-Reveal
 
-**How It Works:**
+**Default flow (atomic):** Use `swap_exact_tokens_for_tokens(amount_in, min_amount_out, path, to, deadline)`. One transaction; slippage and deadline protection. No multi-block delay.
 
-1. **Commit Phase**: User submits `keccak256(amount_in, salt)` hash
-   - MEV bots see: Random hash (no actionable information)
-   - Swap parameters remain hidden
+**Optional commit-reveal (MEV protection):**
 
-2. **Time-Lock**: 5-block delay enforced on-chain
-   - Prevents immediate front-running
-   - Allows user to set optimal gas price
+1. **Commit**: User submits `keccak256(amount_in, salt)`; parameters hidden from mempool.
+2. **Delay**: 5-block minimum before reveal.
+3. **Reveal**: User submits `(amount_in, salt, min_amount_out)`; contract verifies hash and executes.
 
-3. **Reveal Phase**: User submits `(amount_in, salt, min_amount_out)`
-   - Contract verifies hash matches commitment
-   - Swap executes atomically with slippage protection
-
-**Security Guarantees:**
-
-| Attack Vector | Protection Mechanism | Status |
-|--------------|---------------------|--------|
-| **Front-Running** | Commitment hash hides swap parameters | ✅ Protected |
-| **Sandwich Attacks** | 5-block delay prevents immediate execution | ✅ Protected |
-| **Hash Forgery** | keccak256 cryptographic commitment | ✅ Protected |
-| **Commitment Replay** | State cleared before execution | ✅ Protected |
+Use atomic execution for best UX and execution quality; enable commit-reveal in the UI when you want MEV protection.
 
 ### ⚡ Flash Swaps & Capital Efficiency
 
@@ -232,7 +206,7 @@ Oak Protocol implements **defense-in-depth** security patterns:
 
 **Security Audit Status:**
 
-- ✅ **Internal Security Review**: Complete ([SECURITY_REVIEW.md](./SECURITY_REVIEW.md))
+- ✅ **In-house Unit & Integration Testing**: See [docs/IN_HOUSE_TESTING.md](docs/IN_HOUSE_TESTING.md) (no external audit report)
 - ✅ **Critical Vulnerabilities**: 0
 - ✅ **High-Risk Vulnerabilities**: 0
 - 🔄 **External Audit**: Planned (Q2 2026)
@@ -592,7 +566,7 @@ npx ts-node interaction.ts addLiquidity \
 - ✅ `init` - Initialize contract
 - ✅ `commit` - Create swap commitment
 - ✅ `reveal` - Execute swap
-- ✅ `swap` - Complete commit-reveal flow
+- ✅ `swap_exact_tokens_for_tokens` - Atomic swap (default); `commit_swap` + `reveal_swap` optional
 - ✅ `addLiquidity` - Add liquidity to pool
 
 See [`scripts/README.md`](./scripts/README.md) for detailed usage.
@@ -612,15 +586,15 @@ Oak Protocol implements **comprehensive security measures**:
 | **Access Control** | Owner-only guards | ✅ Protected |
 | **Input Validation** | Comprehensive sanitization | ✅ Enforced |
 | **Emergency Pause** | Owner-controlled pause | ✅ Available |
-| **MEV Resistance** | Cryptographic commit-reveal | ✅ Implemented |
+| **Execution** | Atomic swap (default) + optional commit-reveal | ✅ Implemented |
 
-### Internal Security Review
+### In-house Unit & Integration Testing
 
-We conducted a **comprehensive internal security audit** covering:
+We maintain a **transparent testing log** (no external audit report) covering:
 
 - ✅ **Re-entrancy Analysis**: All attack vectors analyzed
 - ✅ **Integer Overflow/Underflow**: 100% checked arithmetic verified
-- ✅ **MEV Resistance**: Cryptographic security evaluated
+- ✅ **Slippage & deadline**: Atomic swap path and optional commit-reveal evaluated
 - ✅ **Access Control**: All admin functions audited
 - ✅ **Mathematical Correctness**: CPMM and fee formulas verified
 - ✅ **Gas Optimization**: Stylus-specific optimizations reviewed
@@ -655,14 +629,14 @@ We conducted a **comprehensive internal security audit** covering:
 ### Phase 1: Foundation (Q1 2026) ✅
 
 - [x] Core protocol implementation (Rust/Stylus)
-- [x] Commit-reveal MEV resistance
+- [x] Atomic swap by default; optional commit-reveal
 - [x] Flash swap functionality
 - [x] Internal security review
 - [x] Testnet deployment (Arbitrum Sepolia)
 - [x] Developer tooling and scripts
 - [x] **GMX-inspired dashboard** (Next.js 14, Tailwind, Wagmi, RainbowKit)
 - [x] **Real-time price charts** (Lightweight-Charts v5)
-- [x] **MEV-protection-ready swap UI** (slippage, deadline, pool info)
+- [x] **Swap UI** with expected price, slippage, deadline
 
 **Status**: ✅ **COMPLETE**
 
@@ -672,7 +646,7 @@ We conducted a **comprehensive internal security audit** covering:
 - [ ] Multisig treasury setup
 - [ ] Mainnet deployment (Arbitrum One)
 - [ ] Liquidity bootstrapping
-- [ ] Wire frontend to deployed contract (commit-reveal flow)
+- [ ] Wire frontend to deployed contract (atomic + optional commit-reveal)
 - [ ] Documentation site
 
 **Target**: Q2 2026
@@ -787,5 +761,5 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
   Built for the Arbitrum Foundation Grant Program
 </p>
 <p align="center">
-  <em>Eliminating MEV. Restoring Fairness. Building the Future.</em>
+  <em>Institutional order types on Stylus. Built for execution quality.</em>
 </p>

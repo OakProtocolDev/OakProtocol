@@ -38,6 +38,8 @@ pub const BUYBACK_FEE_PCT: u64 = 20;
 
 /// Circuit breaker: auto-trigger when single-hop price impact exceeds this (basis points). 2000 = 20%.
 pub const CIRCUIT_BREAKER_IMPACT_BPS: u64 = 2000;
+/// TWAP deviation: if price changes more than this per block (basis points), emergency pause. 1500 = 15%.
+pub const TWAP_DEVIATION_BPS_MAX: u64 = 1500;
 
 /// Basis points for price impact (10000 = 100%).
 pub const BPS: u64 = 10_000;
@@ -57,6 +59,21 @@ pub const TIMELOCK_MIN_DELAY_BLOCKS: u64 = 86400;
 /// Gas-rebate share of total fee in basis points (placeholder for future gas rebates).
 /// @dev A small portion of protocol fee is tracked in accrued_gas_rebate_token0.
 pub const GAS_REBATE_BPS: u64 = 5;
+
+/// Batch execution: fee rebate in basis points (e.g. 2000 = 20% fee discount for batched positions).
+/// @dev Shared execution uses one swap instead of N; participants get this discount as gas rebate.
+pub const BATCH_FEE_REBATE_BPS: u64 = 2000;
+
+/// Maximum number of positions in a single batch (DoS and block gas limit).
+pub const MAX_BATCH_POSITIONS: u64 = 50;
+
+/// Growth: max referral fee in basis points (e.g. 1000 = 10% of protocol fee).
+pub const REFERRAL_FEE_BPS_MAX: u64 = 1000;
+
+/// Copy Trading: max slippage bps (e.g. 500 = 5%).
+pub const COPY_TRADING_SLIPPAGE_BPS_MAX: u64 = 500;
+/// Copy Trading: max amount ratio bps (10000 = 100% of leader amount).
+pub const COPY_TRADING_AMOUNT_RATIO_BPS_MAX: u64 = 10_000;
 
 /// Q112.64 fixed-point multiplier for TWAP cumulative prices (2^112).
 pub const Q112: u128 = 1u128 << 112;

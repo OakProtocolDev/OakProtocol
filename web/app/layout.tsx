@@ -17,8 +17,8 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Oak Protocol | Decentralized Exchange on Arbitrum",
-  description: "MEV-protected DEX with commit-reveal swaps on Arbitrum Stylus",
+  title: "Oak Stylus Trading Engine | Arbitrum",
+  description: "Native Stylus trading terminal with limit orders, TP/SL and trailing stops on Arbitrum",
 };
 
 export default function RootLayout({

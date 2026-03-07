@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --oak-bg: #050807;
+  --oak-bg-card: #0f1613;
+  --oak-border: #1a2520;
+  --oak-text: #fafafa;
+  --oak-accent: #22c55e;
+}
+
+body {
+  @apply bg-oak-bg text-oak-text-primary min-h-screen antialiased;
+}

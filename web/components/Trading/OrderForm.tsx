@@ -19,7 +19,7 @@ export interface OrderFormProps {
   canExecute: boolean;
   /** Executing in progress. */
   isExecuting: boolean;
-  /** Callback: (amountIn, side, orderType). Page runs 4-step and updates store. */
+  /** Callback: (amountIn, side, orderType). Page runs atomic or commit-reveal and updates store. */
   onExecute: (amountIn: string, side: OrderSide, orderType: OrderType) => Promise<void>;
   className?: string;
 }
@@ -42,6 +42,15 @@ export function OrderForm({
   const balanceNum = parseFloat(balanceEth) || 0;
   const validAmount = amountNum > 0 && amountNum <= balanceNum;
   const isValid = canExecute && validAmount && !isExecuting;
+
+  const priceNum = marketPrice ? parseFloat(marketPrice) : 0;
+  const expectedOutput =
+    amountNum > 0 && priceNum > 0
+      ? side === "sell"
+        ? (amountNum * priceNum).toFixed(2)
+        : (amountNum / priceNum).toFixed(6)
+      : null;
+  const outputSymbol = side === "sell" ? "USDC" : "ETH";
 
   const primaryColor = isDemoMode
     ? { bg: "rgba(245, 158, 11, 0.9)", hover: "rgba(251, 191, 36, 0.95)", glow: "0 0 24px rgba(245, 158, 11, 0.4)" }
@@ -140,6 +149,11 @@ export function OrderForm({
             className="mt-1 w-full rounded border bg-black/40 px-3 py-2.5 font-mono text-sm text-white placeholder:text-zinc-600 outline-none transition-colors focus:border-emerald-500/50"
             style={{ borderColor: "rgba(0, 255, 0, 0.15)" }}
           />
+          {expectedOutput != null && amount.trim() && (
+            <p className="mt-1.5 font-sans text-xs text-zinc-400">
+              Expected: <span className="font-mono text-emerald-400/90">~{expectedOutput} {outputSymbol}</span>
+            </p>
+          )}
         </div>
 
         {/* Leverage 1x–50x glassmorphism */}

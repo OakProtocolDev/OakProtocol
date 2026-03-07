@@ -1,10 +1,12 @@
 //! GMX-style Vault logic for Oak Protocol.
 //!
-//! Internal (non-public) helpers for swap and leverage. All state-changing
-//! entrypoints are intended to be invoked by the OakSentinel after the
-//! Commit–Reveal step. Math is 100% checked; uses alloy_primitives (U256).
+//! Internal (non-public) helpers for swap and leverage. **Shared Execution Batching**:
+//! positions are aggregated in one tx (same block), then one Uniswap-style swap in the pool.
+//! Math is 100% checked; uses alloy_primitives (U256). Storage minimized (packed slot for last batch).
 
 use stylus_sdk::alloy_primitives::{Address, U256};
+use stylus_sdk::block;
+use stylus_sdk::contract;
 
 use crate::errors::{err, OakResult, ERR_DIVISION_BY_ZERO, ERR_OVERFLOW};
 use crate::errors::{
@@ -16,6 +18,7 @@ use crate::errors::{
     ERR_VAULT_INSUFFICIENT_RESERVE,
 };
 use crate::state::OakSentinel;
+use crate::token::{safe_transfer, safe_transfer_from};
 
 /// Basis points divisor (10_000 = 100%).
 const BASIS_POINTS_DIVISOR: u64 = 10_000;
@@ -308,4 +311,68 @@ pub fn _decrease_position(
         decrease_global_short_size(state, size_delta_usd)?;
     }
     Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Shared Execution Batching: aggregate positions in one tx, one swap in pool
+// -----------------------------------------------------------------------------
+
+/// Pack (block_number, total_amount_in) into one slot for minimal storage.
+#[inline]
+fn pack_batch_slot(block_num: u64, total_in: U256) -> U256 {
+    let hi = U256::from(block_num).wrapping_shl(128);
+    let lo = total_in & (U256::from(1u64).wrapping_shl(128).wrapping_sub(U256::from(1u64)));
+    hi | lo
+}
+
+/// Batch swap: aggregate contributions in this transaction (same block), perform one _swap, distribute.
+///
+/// @notice Shared Execution Batching. Caller passes list of (owner, amount_in). Contract pulls
+///         token_in from each owner, executes one Uniswap-style swap in the pool, then distributes
+///         token_out proportionally. Minimizes storage (no per-tx batch accumulator; single packed slot for analytics).
+pub fn batch_swap(
+    state: &mut OakSentinel,
+    token_in: Address,
+    token_out: Address,
+    contributions: &[(Address, U256)],
+    min_amount_out: U256,
+    price_in: U256,
+    price_out: U256,
+    fee_bps: u64,
+) -> OakResult<U256> {
+    if contributions.is_empty() {
+        return Err(err(ERR_INSUFFICIENT_INPUT_AMOUNT));
+    }
+    let contract_addr = contract::address();
+    let mut total_in = U256::ZERO;
+    for (_owner, amount) in contributions.iter() {
+        total_in = total_in.checked_add(*amount).ok_or_else(|| err(ERR_OVERFLOW))?;
+    }
+    if total_in.is_zero() {
+        return Err(err(ERR_INSUFFICIENT_INPUT_AMOUNT));
+    }
+    for (owner, amount) in contributions.iter() {
+        if amount.is_zero() {
+            continue;
+        }
+        safe_transfer_from(token_in, *owner, contract_addr, *amount)?;
+    }
+    let amount_out = _swap(state, token_in, token_out, total_in, price_in, price_out, fee_bps)?;
+    if amount_out < min_amount_out {
+        return Err(err(crate::errors::ERR_SLIPPAGE_EXCEEDED));
+    }
+    for (owner, amount) in contributions.iter() {
+        if amount.is_zero() {
+            continue;
+        }
+        let share = amount_out
+            .checked_mul(*amount)
+            .ok_or_else(|| err(ERR_OVERFLOW))?
+            .checked_div(total_in)
+            .ok_or_else(|| err(ERR_DIVISION_BY_ZERO))?;
+        safe_transfer(token_out, *owner, share)?;
+    }
+    let block_num = block::number();
+    state.vault_last_batch_packed.set(pack_batch_slot(block_num, total_in));
+    Ok(amount_out)
 }

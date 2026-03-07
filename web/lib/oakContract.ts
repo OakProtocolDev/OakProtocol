@@ -68,6 +68,29 @@ export const oakOrderAbi = [
     outputs: [{ name: "", type: "uint256", internalType: "uint256" }],
   },
   {
+    name: "get_amounts_out",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      { name: "amount_in", type: "uint256", internalType: "uint256" },
+      { name: "path", type: "address[]", internalType: "address[]" },
+    ],
+    outputs: [{ name: "", type: "uint256[]", internalType: "uint256[]" }],
+  },
+  {
+    name: "swap_exact_tokens_for_tokens",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "amount_in", type: "uint256", internalType: "uint256" },
+      { name: "amount_out_min", type: "uint256", internalType: "uint256" },
+      { name: "path", type: "address[]", internalType: "address[]" },
+      { name: "to", type: "address", internalType: "address" },
+      { name: "deadline", type: "uint256", internalType: "uint256" },
+    ],
+    outputs: [{ name: "", type: "uint256[]", internalType: "uint256[]" }],
+  },
+  {
     name: "close_position_market",
     type: "function",
     stateMutability: "nonpayable",
@@ -191,6 +214,16 @@ export const oakOrderAbi = [
     type: "function",
     stateMutability: "view",
     inputs: [],
+    outputs: [{ name: "", type: "uint256", internalType: "uint256" }],
+  },
+  {
+    name: "batch_execute_positions",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "position_ids", type: "uint256[]", internalType: "uint256[]" },
+      { name: "min_amount_out", type: "uint256", internalType: "uint256" },
+    ],
     outputs: [{ name: "", type: "uint256", internalType: "uint256" }],
   },
 ] as const;

@@ -30,7 +30,7 @@ export function Header() {
             href="/"
             className="text-xl font-semibold tracking-tight text-oak-text-primary transition-opacity hover:opacity-90"
           >
-            Oak Protocol
+            Oak
           </Link>
           <nav className="flex items-center gap-1">
             <motion.div whileTap={springTap}>

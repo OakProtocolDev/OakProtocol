@@ -1,4 +1,4 @@
-# Oak Protocol — Full Grant Application ($35,000)
+# Oak Protocol — Full Grant Application (Arbitrum Grant)
 
 ---
 
@@ -10,7 +10,13 @@
 
 ## 2. Team
 
-Solo founder with 4+ years in systems programming and smart contracts. Background in Rust and low-level systems; prior work includes DeFi tooling and on-chain protocol logic. Shipped Oak Protocol from design to full codebase: Rust/Stylus core (CPMM, multi-pool, router, commit–reveal, flash swaps), internal security review, test suite (stress, re-entrancy, dust, router), and GMX-style dashboard (Next.js 14, Wagmi, RainbowKit). Focus is on security-first mainnet launch: grant funds will go to an external audit and deployment, not marketing.
+**Experience (Rust / Stylus):**
+
+- **Rust & systems**: 4+ years systems programming; Rust used for performance-critical and safety-critical code (no_std, WASM, Stylus). Oak Protocol core is 100% Rust: Stylus `sol_storage!`, CPMM math, multi-pool router, commit–reveal, flash swaps, TimelockController, circuit breaker, and TWAP deviation emergency logic.
+- **Stylus / Arbitrum**: Native Stylus development: contract layout, EVM interop (raw_log events, precompiles), gas-conscious patterns. Oak is designed for Arbitrum One deployment and Stylus toolchain (cargo-stylus, WASM).
+- **DeFi / smart contracts**: Prior DeFi tooling and on-chain protocol logic; internal security review (threat model, in-house tests, audit-ready docs). Shipped full codebase: core engine, growth layer, intelligence layer (copy trading, signal marketplace), and ecosystem UI (profile, leaderboard, bridge apps).
+
+Solo founder; grant funds will go to **Testnet completion** and **external security audit**, not marketing.
 
 ---
 
@@ -39,25 +45,31 @@ We build **natively on Arbitrum Stylus** to prove that production DeFi (DEX, MEV
 
 ---
 
-## 5. Milestones and use of funds ($35,000)
+## 5. Milestones and use of funds
 
-| Milestone | Deliverable | Budget |
-|-----------|-------------|--------|
-| **M1: External audit** | Engagement with audit firm; remediation; public report or summary | $25,000 |
-| **M2: Mainnet deployment** | Deploy to Arbitrum One; verification; fee/treasury/pause config | $3,000 |
-| **M3: Launch & bootstrap** | Documentation, 1–2 initial pools, minimal LP seeding | $5,000 |
-| **Reserve** | Post-audit fixes or unexpected costs | $2,000 |
+**Budget split (transparent):**
 
-**Total ask:** $35,000.
+| Item | Amount | Purpose |
+|------|--------|---------|
+| **Testnet completion** | $10,000 | Finalize Testnet MVP: deployment, integration tests on testnet, documentation, and any remaining engineering to reach “audit-ready” state. |
+| **Security audit** | $10,000 | External audit by a recognized firm; remediation of findings; public report or summary. We plan to engage **2–3 top-tier auditors** (e.g. **Spearbit**, **OpenZeppelin**, **Code4rena** or similar) for quotes and select one within the grant timeline. |
+| **Reserve / deployment** | As needed | Post-audit fixes, mainnet deployment, and minimal bootstrap (e.g. 1–2 pools). |
 
-Funds are used for **audit** (required for mainnet) and **launch** (deployment + bootstrap). No speculative marketing; focus is security and adoption.
+**Milestones (clear and verifiable):**
+
+| Milestone | Deliverable | Success criteria |
+|-----------|-------------|------------------|
+| **Milestone 1: Testnet MVP** | Deploy Oak Stylus contract to Arbitrum testnet; run integration tests on-chain; document deployment and test logs. | Contract live on testnet; test suite green; audit-ready code and docs (SECURITY_AUDIT.md, threat model, events for The Graph). |
+| **Milestone 2: Security audit completion** | Sign engagement with chosen auditor (Spearbit / OpenZeppelin / other); complete audit; remediate critical/high findings; receive and publish report or summary. | Signed audit report or summary; no open critical/high issues (or documented acceptance of risk). |
+
+**Total ask:** $20,000 ($10k Testnet + $10k audit). Any remainder can go to reserve or mainnet deployment.
 
 ---
 
 ## 6. Traction and proof of work
 
 - **Code**: [https://github.com/OakProtocolDev/OakProtocol](https://github.com/OakProtocolDev/OakProtocol). Rust contracts + Next.js app; stress tests (fees, re-entrancy, dust, limits), router integration tests, and general integration tests.
-- **Security**: Internal review in `AUDIT.md`; testnet deployment and public dashboard URL will be live upon grant acceptance.
+- **Security**: Internal review in `SECURITY_AUDIT.md`; audit-ready summary in `docs/SECURITY_AUDIT.md` (threat model, governance/Timelock, formal verification plan). Testnet deployment and public dashboard URL will be live upon grant acceptance.
 - **Docs**: README with architecture, security, roadmap; `grants/` folder with one-pager and this application.
 
 ---
@@ -93,4 +105,17 @@ Funds are used for **audit** (required for mainnet) and **launch** (deployment +
 
 ## 10. One-sentence pitch
 
-Oak Protocol is the first MEV-protected DEX on Arbitrum Stylus; we need $35,000 to audit and launch on mainnet so traders get fair execution and the ecosystem gets a production Stylus DeFi showcase.
+Oak Protocol is the first MEV-protected DEX on Arbitrum Stylus; we need grant support to complete the Testnet MVP and fund a professional security audit so we can launch on mainnet with confidence and give the ecosystem a production Stylus DeFi reference.
+
+---
+
+## 11. Response to potential rejection / FAQ
+
+**“Why fund a solo founder?”**  
+The codebase is production-sized (Rust/Stylus core, tests, docs, ecosystem UI). Delivery is evidenced by the repo and internal security review. Grant funds are allocated to **audit and Testnet completion**, not salary; we are seeking execution capital, not team build-out.
+
+**“Why $10k for audit?”**  
+We are requesting a **focused audit budget** ($10k) and will obtain quotes from **Spearbit, OpenZeppelin, and one other top auditor**. If the chosen firm’s quote exceeds $10k, we will use reserve or phase the scope (e.g. core + critical paths first). The amount is stated transparently so the committee can assess feasibility.
+
+**“What if the fund previously declined?”**  
+We have refined the application: **clear milestones** (Testnet MVP → Audit completion), **explicit budget split** ($10k Testnet, $10k audit), **named auditors** we plan to contact, and **stronger team section** (Rust/Stylus experience). We are open to feedback (e.g. different milestone order or audit scope) and can resubmit with adjustments.

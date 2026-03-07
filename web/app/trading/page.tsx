@@ -24,6 +24,9 @@ import { secureSaltHex, scrubSecret, isRevealWindowValid } from "@/lib/security"
 const ZERO = "0x0000000000000000000000000000000000000000";
 const CONTRACT = OAK_CONTRACT_ADDRESS as `0x${string}`;
 
+/** Default: atomic swap (EVM-style). Set true for optional commit-reveal MEV protection. */
+const DEFAULT_USE_COMMIT_REVEAL = false;
+
 const PLACEHOLDER_ORDERS: OrderRow[] = [
   { id: "0x1a2b", type: "Limit Buy", pair: "ETH/USDC", amount: "0.5 ETH", status: "Filled" },
   { id: "0x3c4d", type: "Market Sell", pair: "ETH/USDC", amount: "0.25 ETH", status: "Filled" },
@@ -97,6 +100,7 @@ export default function TradingPage() {
   const { positions: openPositions, isLoading: positionsLoading, refetch: refetchPositions } = useOpenPositions();
   const { closePosition, isPending: closePending } = usePositionActions();
   const [closingId, setClosingId] = useState<bigint | null>(null);
+  const [useCommitReveal, setUseCommitReveal] = useState(DEFAULT_USE_COMMIT_REVEAL);
 
   const priceContracts = useMemo(
     () =>
@@ -187,34 +191,37 @@ export default function TradingPage() {
   const handleExecute = useCallback(
     async (amountIn: string, side: "buy" | "sell", _orderType: "market" | "limit") => {
       const price = lastPrice || "3842.5";
-      const amountOut = (parseFloat(amountIn) * parseFloat(price)).toFixed(6);
+      const amountOut = side === "sell"
+        ? (parseFloat(amountIn) * parseFloat(price)).toFixed(6)
+        : (parseFloat(amountIn) / parseFloat(price)).toFixed(6);
 
       setIsExecuting(true);
-      const salt = secureSaltHex(32);
 
-      addLogEntry(setLogs, "[1/4] Commit: Encrypting with AES-256 equivalent salt…", "info");
-      await new Promise((r) => setTimeout(r, 400));
-
-      const mockBlock = Math.floor(Date.now() / 2000) + 1;
-      addLogEntry(setLogs, `[2/4] Committing to Arbitrum Stylus (Block: ${mockBlock})…`, "info");
-      await new Promise((r) => setTimeout(r, 450));
-
-      addLogEntry(setLogs, "[3/4] Waiting for Reveal Window (15s)…", "info");
-      await new Promise((r) => setTimeout(r, 600));
-
-      const revealDelayBlocks = 12;
-      if (!isRevealWindowValid(revealDelayBlocks, REVEAL_MAX_BLOCKS)) {
-        addLogEntry(setLogs, `Reveal expired: delay ${revealDelayBlocks} blocks > ${REVEAL_MAX_BLOCKS} max. Trade failed.`, "warn");
+      if (useCommitReveal) {
+        const salt = secureSaltHex(32);
+        addLogEntry(setLogs, "[1/4] Commit: Encrypting with AES-256 equivalent salt…", "info");
+        await new Promise((r) => setTimeout(r, 400));
+        const mockBlock = Math.floor(Date.now() / 2000) + 1;
+        addLogEntry(setLogs, `[2/4] Committing to Arbitrum Stylus (Block: ${mockBlock})…`, "info");
+        await new Promise((r) => setTimeout(r, 450));
+        addLogEntry(setLogs, "[3/4] Waiting for Reveal Window (15s)…", "info");
+        await new Promise((r) => setTimeout(r, 600));
+        const revealDelayBlocks = 12;
+        if (!isRevealWindowValid(revealDelayBlocks, REVEAL_MAX_BLOCKS)) {
+          addLogEntry(setLogs, `Reveal expired: delay ${revealDelayBlocks} blocks > ${REVEAL_MAX_BLOCKS} max. Trade failed.`, "warn");
+          scrubSecret(salt);
+          setIsExecuting(false);
+          return;
+        }
+        addLogEntry(setLogs, "[4/4] Executing via MEV-Protected Route…", "info");
         scrubSecret(salt);
-        setIsExecuting(false);
-        return;
+        await new Promise((r) => setTimeout(r, 350));
+        addLogEntry(setLogs, "Trade confirmed · MEV-protected (commit-reveal)", "success");
+      } else {
+        addLogEntry(setLogs, "Executing atomic swap (EVM-style)…", "info");
+        await new Promise((r) => setTimeout(r, 400));
+        addLogEntry(setLogs, "Swap completed", "success");
       }
-
-      addLogEntry(setLogs, "[4/4] Executing via MEV-Protected Route…", "info");
-      scrubSecret(salt);
-      await new Promise((r) => setTimeout(r, 350));
-
-      addLogEntry(setLogs, "Trade confirmed · Frontrunning protected", "success");
 
       if (side === "sell") {
         applySwap("ETH", "USDC", parseFloat(amountIn), parseFloat(amountOut));
@@ -237,7 +244,7 @@ export default function TradingPage() {
       setSuccessModal({ isOpen: true, txHash, amountIn: side === "sell" ? amountIn : amountOut, amountOut: side === "sell" ? amountOut : amountIn });
       setIsExecuting(false);
     },
-    [lastPrice, isDemoMode, applySwap, addTransaction]
+    [lastPrice, isDemoMode, applySwap, addTransaction, useCommitReveal]
   );
 
   const high = lastPrice ? (parseFloat(lastPrice) * 1.02).toFixed(2) : "—";
@@ -255,6 +262,7 @@ export default function TradingPage() {
         token0Symbol="ETH"
         token1Symbol="USDC"
         isDemo={isDemoMode}
+        useCommitReveal={useCommitReveal}
         onClose={() => setSuccessModal((s) => ({ ...s, isOpen: false }))}
       />
       <main className="flex flex-1 overflow-hidden">
@@ -342,6 +350,32 @@ export default function TradingPage() {
               isExecuting={isExecuting}
               onExecute={handleExecute}
             />
+            <label className="mt-2 flex cursor-pointer items-center gap-2 font-sans text-xs text-zinc-400">
+              <input
+                type="checkbox"
+                checked={useCommitReveal}
+                onChange={(e) => setUseCommitReveal(e.target.checked)}
+                className="rounded border-white/20 bg-black/40 accent-emerald-500"
+              />
+              <span>Use commit-reveal (MEV protection)</span>
+            </label>
+            <div
+              className="mt-2 flex flex-col gap-1 rounded border px-3 py-2"
+              style={{
+                background: "rgba(34, 197, 94, 0.06)",
+                borderColor: "rgba(34, 197, 94, 0.25)",
+              }}
+            >
+              <div className="flex items-center gap-2 font-sans text-sm font-medium text-emerald-400/90">
+                <span aria-hidden className="text-base leading-none">
+                  ⚡
+                </span>
+                <span>Smart Execute</span>
+              </div>
+              <p className="font-sans text-xs text-zinc-400">
+                Save up to 80% on execution fees via Stylus Batching.
+              </p>
+            </div>
             <TPSLOrderForm className="mt-1" />
             <LiveLogsPanel logs={logs} maxLines={8} variant="terminal" className="min-h-0 flex-1 overflow-hidden" />
           </aside>

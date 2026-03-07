@@ -91,6 +91,10 @@ sol_storage! {
         /// TWAP Oracle: block number (or timestamp) of last oracle update.
         /// @dev On L2 we use block number as time index for gas efficiency.
         StorageU256 block_timestamp_last;
+        /// TWAP deviation circuit breaker: last observed price0 (Q112.64) for per-block deviation check.
+        StorageU256 last_twap_price0;
+        /// TWAP deviation circuit breaker: last observed price1 (Q112.64) for per-block deviation check.
+        StorageU256 last_twap_price1;
 
         /// Gas-rebate reserve: portion of protocol fee tracked for future gas rebates (placeholder).
         StorageU256 accrued_gas_rebate_token0;
@@ -185,6 +189,56 @@ sol_storage! {
         /// Timelock: operation_id (keccak256(target,value,data,predecessor,salt)) -> block number after which execute is allowed.
         StorageMap<FixedBytes<32>, StorageU256> timelock_ready_block;
 
+        /// --- Growth Engine: Referral ---
+        /// referee => referrer (who referred this address).
+        StorageMap<Address, StorageAddress> referral_referrer;
+        /// Referral fee in basis points (e.g. 500 = 5% of protocol fee to referrer).
+        StorageU256 referral_fee_bps;
+
+        /// --- Growth Engine: StakingRewards (LP tokens ERC-20 / ERC-1155) ---
+        /// Reward token address.
+        StorageAddress staking_reward_token;
+        /// Staking token (LP token address; ERC-20 or ERC-1155).
+        StorageAddress staking_token;
+        /// Reward per token scaled (accumulated).
+        StorageU256 staking_reward_per_token_stored;
+        /// Last block number when rewards were updated.
+        StorageU256 staking_last_update_block;
+        /// Reward rate per block (reward tokens per block).
+        StorageU256 staking_reward_rate_per_block;
+        /// User: reward per token paid (snapshot at last action).
+        StorageMap<Address, StorageU256> staking_user_reward_per_token_paid;
+        /// User: pending rewards to claim.
+        StorageMap<Address, StorageU256> staking_user_rewards;
+        /// User: staked balance (LP tokens).
+        StorageMap<Address, StorageU256> staking_user_balance;
+        /// Total staked supply (for reward math).
+        StorageU256 staking_total_staked;
+
+        /// --- Growth Engine: Quest (XP / Badges for volume) ---
+        /// User cumulative trading volume (for milestones).
+        StorageMap<Address, StorageU256> quest_user_volume;
+        /// User XP (experience points).
+        StorageMap<Address, StorageU256> quest_user_xp;
+        /// Badge NFT contract (optional; 0 = no NFT).
+        StorageAddress quest_badge_contract;
+
+        /// --- Intelligence Layer: Copy Trading ---
+        /// Follower => leader they copy (0 = no subscription).
+        StorageMap<Address, StorageAddress> copy_trading_leader;
+        /// Follower => max slippage in bps (e.g. 50 = 0.5%).
+        StorageMap<Address, StorageU256> copy_trading_slippage_bps;
+        /// Follower => amount ratio in bps (e.g. 5000 = 50% of leader amount).
+        StorageMap<Address, StorageU256> copy_trading_amount_ratio_bps;
+
+        /// --- Intelligence Layer: Signal Marketplace ---
+        /// seller => (signal_id_bytes32 => price in protocol tokens). 0 = delisted.
+        StorageMap<Address, StorageMap<FixedBytes<32>, StorageU256>> signal_price;
+        /// buyer => (listing_hash => true if purchased). Content key delivered off-chain after payment.
+        StorageMap<Address, StorageMap<FixedBytes<32>, StorageBool>> signal_purchased;
+        /// Per-seller nonce for EIP-712 SignalListing replay protection.
+        StorageMap<Address, StorageU256> signal_nonce;
+
         /// Reserved space for future protocol extensions (e.g. Oak Bet).
         StorageU256 reserved3;
     }
@@ -215,6 +269,10 @@ sol_storage! {
         /// Global short and long exposure in USD.
         StorageU256 vault_global_short_size_usd;
         StorageU256 vault_global_long_size_usd;
+
+        /// Last batch: packed (block_number << 128) | total_amount_in for analytics / gas-rebate rating.
+        /// @dev Single slot to minimize storage; decode with (val >> 128) and (val & ((1<<128)-1)).
+        StorageU256 vault_last_batch_packed;
 
         /// Reserved space for Oak Bet / future vault features.
         StorageU256 sentinel_reserved0;

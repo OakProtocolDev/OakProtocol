@@ -1,0 +1,21 @@
+{
+  "name": "oak-protocol",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Oak Protocol monorepo: contract, apps (profile, leaderboard, bridge), shared UI",
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "build:ui": "npm run build -w @oak-protocol/ui",
+    "dev:profile": "npm run dev -w @oak-protocol/profile",
+    "dev:leaderboard": "npm run dev -w @oak-protocol/leaderboard",
+    "dev:bridge": "npm run dev -w @oak-protocol/bridge",
+    "rankings": "node apps/leaderboard/scripts/recompute-rankings.js"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

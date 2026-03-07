@@ -15,10 +15,10 @@ use stylus_sdk::{
 use crate::{
     access::{default_admin_role, pauser_role},
     constants::{
-        as_u256, q112_u256, BPS, CIRCUIT_BREAKER_IMPACT_BPS, COMMIT_REVEAL_DELAY, DEFAULT_FEE_BPS,
-        FEE_DENOMINATOR, GAS_REBATE_BPS, INITIAL_FEE, LP_FEE_PCT, MAX_COMMITMENT_AGE, MAX_FEE_BPS,
-        MAX_PATH_LENGTH, MAX_TRADE_RESERVE_BPS, MINIMUM_LIQUIDITY, OWNER_TRANSFER_DELAY_BLOCKS,
-        TREASURY_FEE_BPS, BUYBACK_FEE_PCT, TREASURY_FEE_PCT,
+        as_u256, q112_u256, BPS, BATCH_FEE_REBATE_BPS, CIRCUIT_BREAKER_IMPACT_BPS, COMMIT_REVEAL_DELAY,
+        DEFAULT_FEE_BPS, FEE_DENOMINATOR, GAS_REBATE_BPS, INITIAL_FEE, LP_FEE_PCT, MAX_BATCH_POSITIONS,
+        MAX_COMMITMENT_AGE, MAX_FEE_BPS, MAX_PATH_LENGTH, MAX_TRADE_RESERVE_BPS, MINIMUM_LIQUIDITY,
+        OWNER_TRANSFER_DELAY_BLOCKS, TREASURY_FEE_BPS, BUYBACK_FEE_PCT, TREASURY_FEE_PCT,
     },
     errors::*,
     events::{
@@ -26,8 +26,9 @@ use crate::{
         emit_circuit_breaker_triggered, emit_close_position, emit_commit_swap, emit_flash_swap,
         emit_lp_transfer,         emit_open_position, emit_order_cancelled, emit_order_executed,
         emit_order_placed, emit_owner_changed, emit_pause_changed, emit_pending_owner_set,
-        emit_pool_created, emit_reveal_swap, emit_set_fee, emit_set_position_tp_sl,
-        emit_set_position_trailing, emit_trailing_stop_triggered, emit_withdraw_treasury_fees,
+        emit_batch_positions_executed, emit_pool_created, emit_reveal_swap, emit_set_fee,
+        emit_set_position_tp_sl, emit_set_position_trailing, emit_trailing_stop_triggered,
+        emit_withdraw_treasury_fees,
     },
     pausable::Pausable,
     state::OakDEX,
@@ -73,7 +74,8 @@ fn require_non_zero_address(addr: Address) -> OakResult<()> {
 ///
 /// @notice Checks and sets the global `locked` flag.
 /// @dev Must be paired with `unlock_reentrancy_guard` in a finally-like pattern.
-fn lock_reentrancy_guard(dex: &mut OakDEX) -> OakResult<()> {
+///      Pub(crate) so that entrypoints in intelligence/growth that perform external calls can use it.
+pub(crate) fn lock_reentrancy_guard(dex: &mut OakDEX) -> OakResult<()> {
     if dex.locked.get() {
         return Err(err(ERR_REENTRANT_CALL));
     }
@@ -85,7 +87,7 @@ fn lock_reentrancy_guard(dex: &mut OakDEX) -> OakResult<()> {
 ///
 /// @notice Clears the global `locked` flag.
 /// @dev Must be called after `lock_reentrancy_guard` to prevent deadlock.
-fn unlock_reentrancy_guard(dex: &mut OakDEX) {
+pub(crate) fn unlock_reentrancy_guard(dex: &mut OakDEX) {
     dex.locked.set(false);
 }
 
@@ -175,11 +177,9 @@ fn update_oracle(dex: &mut OakDEX, reserve0: U256, reserve1: U256) -> OakResult<
     Ok(())
 }
 
-/// Core swap processing with configurable from/to (for direct swaps and order execution).
-///
-/// @notice When `from` == contract, no transfer_in is performed (tokens already in contract).
-/// @dev Used by process_swap (from=to=msg::sender) and execute_order (from=contract, to=order_owner).
-fn process_swap_from_to(
+/// Internal swap with explicit fee (used for batch execution and engine).
+#[allow(dead_code)]
+pub(crate) fn process_swap_from_to_with_fee(
     dex: &mut OakDEX,
     from: Address,
     to: Address,
@@ -187,6 +187,7 @@ fn process_swap_from_to(
     token1: Address,
     amount_in: U256,
     min_amount_out: U256,
+    fee_bps: U256,
 ) -> OakResult<U256> {
     require_non_zero_address(token0)?;
     require_non_zero_address(token1)?;
@@ -207,13 +208,12 @@ fn process_swap_from_to(
         }
     }
 
-    // Snapshot pool reserves and fee configuration.
+    // Snapshot pool reserves.
     let (pool_token0, pool_token1) = if token0 < token1 {
         (token0, token1)
     } else {
         (token1, token0)
     };
-    // First, read reserves via a short-lived mutable borrow.
     let (reserve0, reserve1) = {
         let mut outer = dex.pools.setter(pool_token0);
         let pool = outer.setter(pool_token1);
@@ -222,10 +222,11 @@ fn process_swap_from_to(
         }
         (pool.reserve0.get(), pool.reserve1.get())
     };
-    let fee_bps = dex.protocol_fee_bps.get();
 
     // TWAP oracle: update cumulative prices at the beginning of every swap.
     update_oracle(dex, reserve0, reserve1)?;
+    // Emergency: if TWAP price deviates >15% per block, pause and trigger circuit breaker.
+    crate::engine::check_price_deviation(dex, reserve0, reserve1)?;
 
     // Determine direction within the pool and compute amount_out.
     let (reserve_in, reserve_out) = if token0 == pool_token0 {
@@ -326,13 +327,25 @@ fn process_swap_from_to(
     dex.total_volume_token0.set(new_volume0);
     dex.total_volume_token1.set(new_volume1);
 
-    // Per-token treasury and buyback (60/20/20 model).
+    // Quest: record volume for swapper (for bonus.oak.trade XP/Badges).
+    let _ = crate::growth::QuestSystem::record_volume(dex, from, amount_in);
+
+    // Transfer in: from -> contract (before referral so contract has tokens)
     let token_in = token0;
+    if from != contract_addr {
+        safe_transfer_from(token0, from, contract_addr, amount_in)?;
+    }
+
+    // Referral Engine: send % of treasury_fee to referrer (referee = from).
+    let referral_amount = crate::growth::ReferralEngine::distribute_referral_fee(dex, token_in, treasury_fee, from)?;
+    let treasury_net = treasury_fee.checked_sub(referral_amount).ok_or_else(|| err(ERR_OVERFLOW))?;
+
+    // Per-token treasury and buyback (60/20/20 model).
     let prev_treasury = dex.treasury_balance.setter(token_in).get();
     let prev_buyback = dex.buyback_balance.setter(token_in).get();
     dex.treasury_balance.setter(token_in).set(
         prev_treasury
-            .checked_add(treasury_fee)
+            .checked_add(treasury_net)
             .ok_or_else(|| err(ERR_OVERFLOW))?,
     );
     dex.buyback_balance.setter(token_in).set(
@@ -358,14 +371,29 @@ fn process_swap_from_to(
         dex.accrued_gas_rebate_token0.set(new_acc);
     }
 
-    // Transfer in: from -> contract (skip if from == contract, tokens already there)
-    if from != contract_addr {
-        safe_transfer_from(token0, from, contract_addr, amount_in)?;
-    }
     // Transfer out: contract -> to
     safe_transfer(token1, to, amount_out)?;
 
+    crate::events::emit_swap_executed(from, token0, token1, amount_in, amount_out);
+
     Ok(amount_out)
+}
+
+/// Core swap processing with configurable from/to (for direct swaps and order execution).
+///
+/// @notice When `from` == contract, no transfer_in is performed (tokens already in contract).
+/// @dev Used by process_swap (from=to=msg::sender) and execute_order (from=contract, to=order_owner).
+fn process_swap_from_to(
+    dex: &mut OakDEX,
+    from: Address,
+    to: Address,
+    token0: Address,
+    token1: Address,
+    amount_in: U256,
+    min_amount_out: U256,
+) -> OakResult<U256> {
+    let fee_bps = dex.protocol_fee_bps.get();
+    process_swap_from_to_with_fee(dex, from, to, token0, token1, amount_in, min_amount_out, fee_bps)
 }
 
 /// Core swap processing: invariant math, slippage protection, fee accounting and transfers.
@@ -408,18 +436,59 @@ fn permit_swap_type_hash() -> FixedBytes<32> {
     crypto::keccak(b"PermitSwap(address owner,address tokenIn,address tokenOut,uint256 amountIn,uint256 minAmountOut,uint256 deadline,uint256 nonce)")
 }
 
+/// keccak256("SignalListing(address seller,bytes32 signalIdHash,uint256 price,uint256 nonce,uint256 deadline)")
+fn signal_listing_type_hash() -> FixedBytes<32> {
+    crypto::keccak(b"SignalListing(address seller,bytes32 signalIdHash,uint256 price,uint256 nonce,uint256 deadline)")
+}
+
+/// EIP-712 struct hash for SignalListing (used as listing_hash and in digest).
+pub(crate) fn compute_signal_listing_struct_hash(
+    seller: Address,
+    signal_id_hash: FixedBytes<32>,
+    price: U256,
+    nonce: U256,
+    deadline: U256,
+) -> FixedBytes<32> {
+    let mut enc = Vec::with_capacity(192);
+    enc.extend_from_slice(signal_listing_type_hash().as_slice());
+    enc.extend_from_slice(&enc_addr(seller));
+    enc.extend_from_slice(signal_id_hash.as_slice());
+    enc.extend_from_slice(&enc_u256(price));
+    enc.extend_from_slice(&enc_u256(nonce));
+    enc.extend_from_slice(&enc_u256(deadline));
+    crypto::keccak(&enc)
+}
+
+/// EIP-712 digest for SignalListing: "\x19\x01" || domainSeparator || structHash.
+pub(crate) fn compute_signal_listing_digest(
+    seller: Address,
+    signal_id_hash: FixedBytes<32>,
+    price: U256,
+    nonce: U256,
+    deadline: U256,
+    domain_separator: &FixedBytes<32>,
+) -> FixedBytes<32> {
+    let struct_hash = compute_signal_listing_struct_hash(seller, signal_id_hash, price, nonce, deadline);
+    let mut prefix = Vec::with_capacity(66);
+    prefix.extend_from_slice(b"\x19\x01");
+    prefix.extend_from_slice(domain_separator.as_slice());
+    prefix.extend_from_slice(struct_hash.as_slice());
+    crypto::keccak(&prefix)
+}
+
+
 /// Encode 32-byte value for ABI (left-pad to 32 bytes).
-fn enc_u256(x: U256) -> [u8; 32] {
+pub(crate) fn enc_u256(x: U256) -> [u8; 32] {
     x.to_be_bytes::<32>()
 }
-fn enc_addr(a: Address) -> [u8; 32] {
+pub(crate) fn enc_addr(a: Address) -> [u8; 32] {
     let mut out = [0u8; 32];
     out[12..32].copy_from_slice(a.as_slice());
     out
 }
 
 /// Compute EIP-712 domain separator: hash of encoded domain.
-fn compute_domain_separator(verifying_contract: Address, chain_id: u64) -> FixedBytes<32> {
+pub(crate) fn compute_domain_separator(verifying_contract: Address, chain_id: u64) -> FixedBytes<32> {
     let name_hash = crypto::keccak(EIP712_NAME);
     let version_hash = crypto::keccak(EIP712_VERSION);
     let mut enc = Vec::with_capacity(128);
@@ -461,7 +530,7 @@ fn compute_permit_swap_digest(
 }
 
 /// Recover signer from EIP-712 digest and (v, r, s). Returns zero address on failure.
-fn ecrecover_recover(digest: FixedBytes<32>, v: u8, r: [u8; 32], s: [u8; 32]) -> Address {
+pub(crate) fn ecrecover_recover(digest: FixedBytes<32>, v: u8, r: [u8; 32], s: [u8; 32]) -> Address {
     let v_normalized = if v <= 1 { v + 27 } else { v };
     let mut calldata = Vec::with_capacity(128);
     calldata.extend_from_slice(digest.as_slice());
@@ -2163,6 +2232,141 @@ impl OakDEX {
         Ok(amount_out)
     }
 
+    /// Batch-close positions: one aggregated swap + gas-rebate (fee discount) shared among participants.
+    ///
+    /// @notice Shared Execution Gas-Rebate: all positions must share the same (base, quote) pair.
+    ///         Contract pulls base from each owner, does ONE swap, distributes quote proportionally.
+    ///         Fee discount (BATCH_FEE_REBATE_BPS) is applied so participants receive more output.
+    /// @param position_ids List of position IDs to close (min 2, max MAX_BATCH_POSITIONS).
+    /// @param min_amount_out Slippage protection for the aggregated swap.
+    pub fn batch_execute_positions(
+        &mut self,
+        position_ids: Vec<U256>,
+        min_amount_out: U256,
+    ) -> OakResult<U256> {
+        let sender = msg::sender();
+        lock_reentrancy_guard(self)?;
+        require_not_paused(self)?;
+
+        let n = position_ids.len() as u64;
+        if n < 2 {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_BATCH_TOO_FEW));
+        }
+        if n > MAX_BATCH_POSITIONS {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_BATCH_TOO_MANY));
+        }
+
+        let contract_addr = contract::address();
+        let mut base_token = Address::ZERO;
+        let mut quote_token = Address::ZERO;
+        let mut total_size = U256::ZERO;
+        // (owner, size, margin_total, key)
+        let mut items: Vec<(Address, U256, U256, Address)> = Vec::with_capacity(position_ids.len());
+
+        for position_id in &position_ids {
+            let key = position_id_to_address(*position_id);
+            let owner = self.position_owner.setter(key).get();
+            if owner == Address::ZERO {
+                unlock_reentrancy_guard(self);
+                return Err(err(ERR_POSITION_NOT_FOUND));
+            }
+            let status = self.position_status.setter(key).get();
+            if status != U256::ZERO {
+                unlock_reentrancy_guard(self);
+                return Err(err(ERR_POSITION_NOT_OPEN));
+            }
+            let base = self.position_base.setter(key).get();
+            let quote = self.position_quote.setter(key).get();
+            if base_token == Address::ZERO {
+                base_token = base;
+                quote_token = quote;
+            } else if base != base_token || quote != quote_token {
+                unlock_reentrancy_guard(self);
+                return Err(err(ERR_BATCH_NOT_SAME_PAIR));
+            }
+            let size = self.position_size.setter(key).get();
+            let initial_collateral = self.position_initial_collateral.setter(key).get();
+            let margin_added = self.position_margin_added.setter(key).get();
+            let margin_total = initial_collateral
+                .checked_add(margin_added)
+                .ok_or_else(|| {
+                    unlock_reentrancy_guard(self);
+                    err(ERR_OVERFLOW)
+                })?;
+            total_size = total_size.checked_add(size).ok_or_else(|| {
+                unlock_reentrancy_guard(self);
+                err(ERR_OVERFLOW)
+            })?;
+            items.push((owner, size, margin_total, key));
+        }
+
+        if total_size.is_zero() {
+            unlock_reentrancy_guard(self);
+            return Err(err(ERR_INSUFFICIENT_INPUT_AMOUNT));
+        }
+
+        // Return margin to each owner and pull base from each owner into contract.
+        for (owner, size, margin_total, key) in &items {
+            self.position_initial_collateral.setter(*key).set(U256::ZERO);
+            self.position_margin_added.setter(*key).set(U256::ZERO);
+            if !margin_total.is_zero() {
+                let prev = self.position_margin_balance.setter(quote_token).get();
+                self.position_margin_balance
+                    .setter(quote_token)
+                    .set(prev.checked_sub(*margin_total).ok_or_else(|| {
+                        unlock_reentrancy_guard(self);
+                        err(ERR_OVERFLOW)
+                    })?);
+                safe_transfer(quote_token, *owner, *margin_total)?;
+            }
+            safe_transfer_from(base_token, *owner, contract_addr, *size)?;
+        }
+
+        // One swap with fee rebate (batch discount).
+        let fee_bps = self.protocol_fee_bps.get();
+        let effective_fee_bps = fee_bps
+            .checked_mul(as_u256(BPS).checked_sub(as_u256(BATCH_FEE_REBATE_BPS)).ok_or_else(|| err(ERR_OVERFLOW))?)
+            .ok_or_else(|| err(ERR_OVERFLOW))?
+            .checked_div(as_u256(BPS))
+            .ok_or_else(|| err(ERR_DIVISION_BY_ZERO))?;
+
+        let total_quote_out = process_swap_from_to_with_fee(
+            self,
+            contract_addr,
+            contract_addr,
+            base_token,
+            quote_token,
+            total_size,
+            min_amount_out,
+            effective_fee_bps,
+        )?;
+
+        // Distribute quote to each owner proportionally (by size); mark closed.
+        for (i, (owner, size, _margin_total, key)) in items.iter().enumerate() {
+            let share = total_quote_out
+                .checked_mul(*size)
+                .ok_or_else(|| err(ERR_OVERFLOW))?
+                .checked_div(total_size)
+                .ok_or_else(|| err(ERR_DIVISION_BY_ZERO))?;
+            self.position_status.setter(*key).set(U256::from(1u64));
+            let pos_id = *position_ids.get(i).unwrap_or(&U256::ZERO);
+            emit_close_position(pos_id, *owner, share);
+            safe_transfer(quote_token, *owner, share)?;
+        }
+
+        emit_batch_positions_executed(
+            sender,
+            total_size,
+            total_quote_out,
+            as_u256(BATCH_FEE_REBATE_BPS),
+            U256::from(n),
+        );
+        unlock_reentrancy_guard(self);
+        Ok(total_quote_out)
+    }
+
     /// Execute TP/SL for a position if condition met (anyone may call; keeper-friendly).
     ///
     /// @param min_amount_out Slippage when closing.
@@ -2389,9 +2593,11 @@ impl OakDEX {
         Ok(())
     }
 
-    /// Protocol analytics: total trading volume (global).
+    /// Protocol analytics: total trading volume (global). Public Analytics for reporting.
     ///
-    /// @notice For dashboards and grant reviewers. Use get_treasury_balance(token) for per-token fees.
+    /// @notice For dashboards and grant reviewers (e.g. Arbitrum Foundation). Volume on-chain;
+    ///         latency and revert_rate are derived off-chain from events/indexer.
+    ///         Use get_treasury_balance(token) for per-token fees.
     pub fn get_protocol_analytics(&self) -> OakResult<(U256, U256)> {
         Ok((
             self.total_volume_token0.get(),

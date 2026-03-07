@@ -98,7 +98,7 @@ export function LiveLogsPanel({
       >
         {displayLogs.length === 0 ? (
           <p className="text-oak-text-muted/60">
-            Swap to see MEV-protected commit-reveal logs…
+            Swap to see execution logs…
           </p>
         ) : (
           <div className="space-y-1">

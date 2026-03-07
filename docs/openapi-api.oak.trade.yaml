@@ -1,0 +1,297 @@
+openapi: 3.0.3
+info:
+  title: Oak Stylus Trading Engine — Public API
+  description: |
+    API for api.oak.trade: pool liquidity state, Gas-Rebate rating, and transaction history.
+    All responses are JSON. Data can be sourced from chain indexers and protocol views.
+  version: 0.1.0
+  contact:
+    name: Oak Protocol
+
+servers:
+  - url: https://api.oak.trade
+    description: Production
+  - url: https://api.oak.trade/v1
+    description: Versioned base (optional)
+
+tags:
+  - name: Pools
+    description: Liquidity pool state
+  - name: Gas-Rebate
+    description: Gas-Rebate rating and batch analytics
+  - name: History
+    description: Transaction history
+
+paths:
+  /pools:
+    get:
+      tags: [Pools]
+      summary: List pool liquidity state
+      description: Returns current liquidity (reserves, TVL, fee) for all pools or a single pool.
+      operationId: getPools
+      parameters:
+        - name: pool
+          in: query
+          description: Optional pool identifier (e.g. token0_token1 address pair).
+          required: false
+          schema:
+            type: string
+            example: "0x..._0x..."
+        - name: chain
+          in: query
+          description: Chain ID (e.g. 421614 Arbitrum Sepolia).
+          required: false
+          schema:
+            type: integer
+            default: 421614
+      responses:
+        '200':
+          description: Pool liquidity state (JSON).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PoolLiquidityResponse'
+        '400':
+          description: Bad request
+        '500':
+          description: Server error
+
+  /pools/{poolId}:
+    get:
+      tags: [Pools]
+      summary: Get single pool liquidity state
+      operationId: getPoolById
+      parameters:
+        - name: poolId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Pool liquidity state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PoolLiquidity'
+        '404':
+          description: Pool not found
+
+  /gas-rebate/rating:
+    get:
+      tags: [Gas-Rebate]
+      summary: Current Gas-Rebate rating
+      description: |
+        Returns the current Gas-Rebate rating (e.g. batch discount, accrued rebate, ranking).
+        Can be derived from on-chain state (accrued_gas_rebate, last_batch_packed, volume).
+      operationId: getGasRebateRating
+      parameters:
+        - name: chain
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 421614
+      responses:
+        '200':
+          description: Gas-Rebate rating (JSON).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GasRebateRating'
+        '500':
+          description: Server error
+
+  /transactions:
+    get:
+      tags: [History]
+      summary: Transaction history
+      description: Paginated list of transactions (swaps, batch executions, orders) in JSON format.
+      operationId: getTransactionHistory
+      parameters:
+        - name: user
+          in: query
+          description: Filter by user address.
+          required: false
+          schema:
+            type: string
+            format: address
+        - name: type
+          in: query
+          description: Filter by type (swap, batch, order, position).
+          required: false
+          schema:
+            type: string
+            enum: [swap, batch, order, position]
+        - name: fromBlock
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: toBlock
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+            maximum: 500
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Pagination cursor.
+      responses:
+        '200':
+          description: Transaction history (JSON).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionHistoryResponse'
+        '400':
+          description: Bad request
+        '500':
+          description: Server error
+
+  /history:
+    get:
+      tags: [History]
+      summary: Alias for transaction history
+      description: Same as GET /transactions. Returns history in JSON format.
+      operationId: getHistory
+      parameters:
+        - name: user
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Transaction history.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionHistoryResponse'
+
+components:
+  schemas:
+    PoolLiquidity:
+      type: object
+      required: [poolId, token0, token1, reserve0, reserve1]
+      properties:
+        poolId:
+          type: string
+          description: Canonical pool identifier (e.g. token0_token1).
+        token0:
+          type: string
+          format: address
+        token1:
+          type: string
+          format: address
+        reserve0:
+          type: string
+          description: Reserve of token0 (wei/raw).
+        reserve1:
+          type: string
+          description: Reserve of token1 (wei/raw).
+        tvlUsd:
+          type: string
+          description: Optional TVL in USD.
+        feeBps:
+          type: integer
+          description: Protocol fee in basis points.
+        blockNumber:
+          type: integer
+          description: Block at which state was read.
+
+    PoolLiquidityResponse:
+      type: object
+      properties:
+        pools:
+          type: array
+          items:
+            $ref: '#/components/schemas/PoolLiquidity'
+        chainId:
+          type: integer
+
+    GasRebateRating:
+      type: object
+      description: Current Gas-Rebate rating for reporting and UI.
+      properties:
+        batchFeeRebateBps:
+          type: integer
+          description: Fee rebate in basis points for batch execution (e.g. 2000 = 20%).
+        accruedRebateToken0:
+          type: string
+          description: Accrued gas-rebate reserve (token0) on-chain.
+        lastBatchBlock:
+          type: integer
+          description: Block number of last batch execution (from packed slot).
+        lastBatchTotalIn:
+          type: string
+          description: Total amount in last batch (from packed slot).
+        rating:
+          type: string
+          description: Optional human-readable rating (e.g. "High", "Medium").
+        chainId:
+          type: integer
+
+    TransactionRecord:
+      type: object
+      properties:
+        txHash:
+          type: string
+        type:
+          type: string
+          enum: [swap, batch, order_place, order_execute, order_cancel, position_open, position_close]
+        user:
+          type: string
+          format: address
+        blockNumber:
+          type: integer
+        timestamp:
+          type: integer
+        amountIn:
+          type: string
+        amountOut:
+          type: string
+        tokenIn:
+          type: string
+        tokenOut:
+          type: string
+        feeBps:
+          type: integer
+        positionIds:
+          type: array
+          items:
+            type: string
+          description: For batch executions.
+
+    TransactionHistoryResponse:
+      type: object
+      properties:
+        transactions:
+          type: array
+          items:
+            $ref: '#/components/schemas/TransactionRecord'
+        nextCursor:
+          type: string
+          nullable: true
+        chainId:
+          type: integer
