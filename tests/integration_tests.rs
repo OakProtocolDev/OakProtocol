@@ -191,36 +191,37 @@ fn twap_price_changes_after_large_swap() {
 
 #[test]
 fn flash_swap_fee_split_and_invariant() {
-    // Model flash swap repayment on token0 side using the same fee math as the contract.
+    // Model flash swap: contract requires k_after >= k_min and balance >= reserve_after_lend + amount_owed.
+    // When repaying only token0, the minimum repayment to satisfy k_after >= k_min exceeds amount_out + fee.
     let reserve0 = U256::from(100_000u64);
     let reserve1 = U256::from(200_000u64);
 
     let k_before = reserve0 * reserve1;
     let fee_bps = as_u256(DEFAULT_FEE_BPS);
 
-    // Borrow some token0 in a flash swap
     let amount0_out = U256::from(10_000u64);
+    let reserve0_after_lend = reserve0 - amount0_out;
 
-    // Protocol fee as in the contract: fee = amount * fee_bps / FEE_DENOMINATOR
-    let total_fee = amount0_out * fee_bps / as_u256(FEE_DENOMINATOR);
-    let amount0_owed = amount0_out + total_fee;
-
-    // Simulate "after" reserves where the borrower repays exactly what is owed
-    let reserve0_after = reserve0 - amount0_out + amount0_owed;
-    let reserve1_after = reserve1;
-    let k_after = reserve0_after * reserve1_after;
-
-    // Minimum k required according to on‑chain logic:
-    // k_min = k_before * (FEE_DENOMINATOR + fee_bps) / FEE_DENOMINATOR
+    // On-chain: k_min = k_before * (FEE_DENOMINATOR + fee_bps) / FEE_DENOMINATOR
     let fee_multiplier = as_u256(FEE_DENOMINATOR) + fee_bps;
     let k_min = k_before * fee_multiplier / as_u256(FEE_DENOMINATOR);
+
+    // Minimum token0 repayment (repaying only token0) so that k_after >= k_min:
+    // reserve0_after = reserve0_after_lend + repay0, reserve1_after = reserve1.
+    // We need reserve0_after * reserve1 >= k_min => repay0 >= k_min/reserve1 - reserve0_after_lend.
+    let reserve0_after_min = (k_min + reserve1 - U256::from(1u64)) / reserve1; // ceiling division
+    let repay0_min = reserve0_after_min - reserve0_after_lend;
+    let reserve0_after = reserve0_after_lend + repay0_min;
+    let reserve1_after = reserve1;
+    let k_after = reserve0_after * reserve1_after;
 
     assert!(
         k_after >= k_min,
         "flash swap repayment must maintain k' >= k * (1 + fee)"
     );
 
-    // Check that fee split accounts for the same total_fee (60/20/20).
+    // Contract fee (0.3% of amount_out) and fee split (60/20/20)
+    let total_fee = amount0_out * fee_bps / as_u256(FEE_DENOMINATOR);
     let (_effective_in, treasury_fee, lp_fee, buyback_fee) =
         compute_fee_split(amount0_out, fee_bps).expect("fee split must succeed");
     let accounted_total_fee = treasury_fee + lp_fee + buyback_fee;

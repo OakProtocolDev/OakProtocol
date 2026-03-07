@@ -3353,7 +3353,10 @@ mod tests {
 
     #[test]
     fn cpmm_floor_rounding_favors_protocol() {
-        // Test that CPMM calculation uses floor rounding (protocol-favorable)
+        // Test that CPMM calculation uses floor rounding (protocol-favorable).
+        // Formula matches get_amount_out_with_fee (Uniswap V2 style):
+        // amount_in_with_fee = amount_in * (FEE_DENOMINATOR - fee_bps), no division.
+        // amount_out = floor((amount_in_with_fee * reserve_out) / (reserve_in * FEE_DENOMINATOR + amount_in_with_fee))
         let amount_in = U256::from(1_000u64);
         let reserve_in = U256::from(10_000u64);
         let reserve_out = U256::from(20_000u64);
@@ -3362,13 +3365,8 @@ mod tests {
         let amount_out = get_amount_out_with_fee(amount_in, reserve_in, reserve_out, fee_bps)
             .unwrap();
 
-        // Calculate exact value (with infinite precision)
-        // amount_in_with_fee = amount_in * (FEE_DENOMINATOR - fee_bps) / FEE_DENOMINATOR
-        // amount_out_exact = (amount_in_with_fee * reserve_out) / (reserve_in * FEE_DENOMINATOR + amount_in_with_fee)
         let amount_in_with_fee = amount_in
             .checked_mul(as_u256(FEE_DENOMINATOR).checked_sub(fee_bps).unwrap())
-            .unwrap()
-            .checked_div(as_u256(FEE_DENOMINATOR))
             .unwrap();
 
         let numerator = amount_in_with_fee
@@ -3381,7 +3379,6 @@ mod tests {
             .checked_add(amount_in_with_fee)
             .unwrap();
 
-        // Integer division performs floor rounding
         let expected_floor = numerator.checked_div(denominator).unwrap();
 
         assert_eq!(

@@ -9,6 +9,20 @@
 
 extern crate alloc;
 
+// Stub for Stylus host hook when building on host (e.g. tests, non-WASM).
+// On wasm32 the Stylus runtime provides native_keccak256; on x86_64 we must supply it.
+#[cfg(not(target_arch = "wasm32"))]
+#[no_mangle]
+pub extern "C" fn native_keccak256(bytes: *const u8, len: usize, output: *mut u8) {
+    use tiny_keccak::{Hasher, Keccak};
+    let mut hasher = Keccak::v256();
+    let mut out = [0u8; 32];
+    let input = unsafe { core::slice::from_raw_parts(bytes, len) };
+    hasher.update(input);
+    hasher.finalize(&mut out);
+    unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), output, 32) };
+}
+
 use alloc::vec::Vec;
 use stylus_sdk::prelude::*;
 

@@ -10,3 +10,4 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 stylus-sdk = "0.6"
 ruint = "=1.16.0"
+tiny-keccak = "2.0"
